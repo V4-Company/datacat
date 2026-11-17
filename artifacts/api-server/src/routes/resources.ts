@@ -5,7 +5,7 @@ import { pool, db, apiKeysTable, invitesTable, usersTable, orgsTable } from "@wo
 import { getOrigin } from "../lib/config";
 import { and, eq } from "drizzle-orm";
 import { requireOrg, requireAdmin, requireAdminOrKeys } from "../middlewares/authMiddleware";
-import { checkWebhookUrl } from "../lib/safeHttp";
+import { checkWebhookUrl, checkWebhookHeaders } from "../lib/safeHttp";
 import { newKey, invalidateKey } from "../lib/org";
 import { evaluateMonitor, validateMonitorQuery } from "../jobs/monitors";
 import { startSampleData, stopSampleData, sampleRunning } from "../jobs/sample";
@@ -488,7 +488,7 @@ router.post(
         req.orgId,
         kind === "slack" ? "slack" : "webhook",
         name,
-        { url, headers: headers ?? null, payload: payload ?? null },
+        { url, headers: checkWebhookHeaders(headers), payload: payload ?? null },
       ])
     ).rows[0];
     res.json(r);
@@ -537,6 +537,7 @@ function webhookConfig(b: any, prev: any = {}) {
         throw new HttpError(400, "custom_headers must be a JSON object");
       }
       if (!headers || typeof headers !== "object" || Array.isArray(headers)) throw new HttpError(400, "custom_headers must be a JSON object");
+      checkWebhookHeaders(headers);
     }
   }
   const encode_as = b.encode_as ?? prev.encode_as ?? "json";

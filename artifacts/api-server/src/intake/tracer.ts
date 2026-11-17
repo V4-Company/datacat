@@ -53,6 +53,23 @@ function decodeV05(buf: Buffer): any[][] {
   );
 }
 
+/**
+ * One DogStatsD line, "metric:value|type<rest>", split without a regular expression. Returns [line, metric, value,
+ * type, rest] (rest starts with "|" when present), or null. A trailing "\r" (CRLF bodies) is ignored.
+ */
+export function parseStatsdLine(line: string): [string, string, string, string, string] | null {
+  if (line.endsWith("\r")) line = line.slice(0, -1);
+  const colon = line.indexOf(":");
+  const pipe = line.indexOf("|");
+  if (colon < 1 || pipe < colon + 2) return null;
+  let t = pipe + 1;
+  while (t < line.length && line.charCodeAt(t) >= 97 && line.charCodeAt(t) <= 122) t++;
+  if (t === pipe + 1) return null;
+  const rest = line.slice(t);
+  if (/[\r\n\u2028\u2029]/.test(rest)) return null;
+  return [line, line.slice(0, colon), line.slice(colon + 1, pipe), line.slice(pipe + 1, t), rest];
+}
+
 function keyFrom(req: Request, spans?: any[][]): string | undefined {
   if (req.params.key) return String(req.params.key);
   if (req.headers["dd-api-key"]) return String(req.headers["dd-api-key"]);
@@ -123,11 +140,17 @@ for (const p of PREFIXES) {
   // DogStatsD over HTTP: newline-separated "metric:value|type|@rate|#tag1,tag2"
   router.post(`${p}/dogstatsd/v2/proxy`, raw, async (req, res) => {
     try {
+      const headerKey = req.params.key ? String(req.params.key) : ((req.headers["dd-api-key"] as string) ?? "");
+      // A key given in the path or a header is checked before the body is read.
+      if (headerKey && !(await orgForApiKey(headerKey))) {
+        res.status(403).json({ accepted: 0 });
+        return;
+      }
       const lines = decompress(req).toString("utf8").split("\n").filter(Boolean);
       const now = Math.floor(Date.now() / 1000);
       const byKey = new Map<string, PointIn[]>();
       for (const line of lines) {
-        const m = /^([^:|]+):([^|]+)\|([a-z]+)(.*)$/.exec(line);
+        const m = parseStatsdLine(line);
         if (!m) continue;
         const parts = m[4].split("|").filter(Boolean);
         const tags = (
@@ -137,7 +160,7 @@ for (const p of PREFIXES) {
             .split(",") ?? []
         ).filter(Boolean);
         const rate = Number(parts.find((x) => x.startsWith("@"))?.slice(1) ?? 1) || 1;
-        let key = req.params.key ? String(req.params.key) : ((req.headers["dd-api-key"] as string) ?? "");
+        let key = headerKey;
         const kt = tags.find((t) => KEY_TAGS.some((k) => t.startsWith(k + ":")));
         if (!key && kt) key = kt.split(":").slice(1).join(":");
         const clean = tags.filter((t) => !KEY_TAGS.some((k) => t.startsWith(k + ":")));

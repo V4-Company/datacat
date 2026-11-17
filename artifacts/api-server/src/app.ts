@@ -35,7 +35,7 @@ app.use(
     },
     serializers: {
       req(req) {
-        return { id: req.id, method: req.method, url: req.url?.split("?")[0]?.replace(/(\/(?:invite|invites|agent|input)\/)[^/]+/g, "$1[redacted]") };
+        return { id: req.id, method: req.method, url: req.url?.split("?")[0]?.replace(/(\/(?:invite|invites|agent|input)\/)[^/]+/gi, "$1[redacted]") };
       },
       res(res) {
         return { statusCode: res.statusCode };
@@ -43,6 +43,12 @@ app.use(
     },
   }),
 );
+// DataCat is never embedded in another page.
+app.use((_req, res, next) => {
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Content-Security-Policy", "frame-ancestors 'none'");
+  next();
+});
 app.use(cors());
 // Agent intake routes take raw (possibly compressed / protobuf) bodies, so they mount before JSON parsing.
 app.use(intakeRouter);

@@ -19,9 +19,24 @@ function setupAllowed(req: Request) {
 
 const router: IRouter = Router();
 
-function getSafeReturnTo(value: unknown): string {
-  if (typeof value !== "string" || !value.startsWith("/") || value.startsWith("//")) return "/";
-  return value;
+// Only same-origin paths: parsed against a fixed origin so "//host", "/\\host" and similar forms are refused.
+export function getSafeReturnTo(value: unknown): string {
+  if (typeof value !== "string" || !value.startsWith("/")) return "/";
+  const base = "http://datacat.invalid";
+  try {
+    const u = new URL(value, base);
+    return u.origin === base ? u.pathname + u.search + u.hash : "/";
+  } catch {
+    return "/";
+  }
+}
+
+// Same accept/reject result as /^[^\s@]+@[^\s@]+\.[^\s@]+$/, in linear time and with the length checked first.
+export function validEmail(email: string): boolean {
+  if (email.length > 254 || /\s/.test(email)) return false;
+  const at = email.indexOf("@");
+  if (at < 1 || at !== email.lastIndexOf("@")) return false;
+  return email.slice(at + 2, -1).includes(".");
 }
 
 router.get("/auth/user", async (req: Request, res: Response) => {
@@ -85,7 +100,7 @@ router.use(["/auth/login", "/auth/setup", "/auth/invites"], (req, res, next) => 
 function credentials(req: Request) {
   const email = typeof req.body?.email === "string" ? req.body.email.trim().toLowerCase() : "";
   const password = req.body?.password;
-  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254 || typeof password !== "string" || password.length < 12 || password.length > 256) {
+  if (!validEmail(email) || typeof password !== "string" || password.length < 12 || password.length > 256) {
     throw new Error("Enter a valid email and a password of 12–256 characters");
   }
   return { email, password };

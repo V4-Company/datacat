@@ -23,7 +23,7 @@ export async function authMiddleware(req: Request, res: Response, next: NextFunc
     const sid = getSessionId(req);
     // Cookie sessions: a state-changing request must come from DataCat's own pages (SameSite=Lax cookies already stop
     // most cross-site requests; this also covers sibling subdomains).
-    if (sid && !SAFE_METHODS.has(req.method) && !req.headers["authorization"]) {
+    if (sid && !SAFE_METHODS.has(req.method)) {
       const origin = req.get("origin");
       if ((origin && origin !== getOrigin(req)) || req.get("sec-fetch-site") === "cross-site") {
         res.status(403).json({ errors: ["Invalid request origin"] });

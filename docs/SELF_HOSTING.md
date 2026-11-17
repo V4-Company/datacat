@@ -162,7 +162,7 @@ use systemd `EnvironmentFile`.
 | --- | --- |
 | `DATABASE_URL` | **Required.** PostgreSQL connection URL. |
 | `PORT` | `3000`, HTTP listener. In Compose this controls the published host port; the container listens on 3000. |
-| `PUBLIC_URL` | Canonical external origin, e.g. `https://observe.example.com`. Used for invite links, installer and in-app documentation. Falls back to the request origin; set explicitly in production. No path prefix. |
+| `PUBLIC_URL` | Canonical external origin, e.g. `https://observe.example.com`. Used for invite links, installer and in-app documentation. **Required when `NODE_ENV=production`**; in development it falls back to the request origin. No path prefix. |
 | `SESSION_SECRET` | **Required in production**, at least 32 random characters. Signs session cookies. Changing it signs browser sessions out. |
 | `DATACAT_RETENTION_DAYS` | `15`, positive telemetry retention window. Legacy `RETENTION_DAYS` is accepted with lower priority. With PostgreSQL, cleanup runs hourly; with ClickHouse it is a table TTL. |
 | `DATACAT_STORAGE` | `postgres`. Telemetry storage: `postgres` or `clickhouse` (see "Choosing telemetry storage"). App data always stays in PostgreSQL. |

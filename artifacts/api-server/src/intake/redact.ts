@@ -46,14 +46,13 @@ const custom = String(env.DATACAT_REDACT_PATTERNS ?? "")
   .map((s) => new RegExp(s, "g"));
 
 const CARD = /\b(?:\d[ -]?){12,18}\d\b/g;
-const BEARER = /\b(Bearer|Basic)\s+[A-Za-z0-9\-._~+/]{8,}=*/gi;
+const BEARER = /\b(Bearer|Basic)\s+([A-Za-z0-9\-._~+/]{4,}=*)/gi;
 const SECRET_PAIR = /\b(password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|client[_-]?secret)(["']?\s*[:=]\s*["']?)([^\s"'&,;]{3,})/gi;
 const AWS_KEY = /\b(AKIA|ASIA)[A-Z0-9]{16}\b/g;
-const PRIVATE_KEY = /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g;
 const JWT = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g;
 const EMAIL = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g;
 // Cheap pre-check: skip strings that cannot match any rule (most log lines and span attributes).
-const MAYBE = /\d{4}|bearer|basic |pass|pwd|secret|token|key|AKIA|ASIA|PRIVATE KEY|eyJ|@/i;
+const MAYBE = /\d[ -]?\d[ -]?\d[ -]?\d|bearer|basic|pass|pwd|secret|token|key|AKIA|ASIA|PRIVATE KEY|eyJ|@/i;
 
 function luhn(digits: string): boolean {
   let sum = 0,
@@ -72,14 +71,46 @@ function luhn(digits: string): boolean {
 
 export const redactionStats = { values: 0, redactions: 0 };
 
+/**
+ * Masks PEM private key blocks ("-----BEGIN ... PRIVATE KEY-----" to the next "-----END ... PRIVATE KEY-----") with
+ * plain string searches, so the cost stays linear however many BEGIN markers a value contains.
+ */
+function maskPrivateKeys(s: string): string {
+  const HEAD = /-----BEGIN [A-Z ]{0,40}PRIVATE KEY-----/g;
+  const TAIL = /-----END [A-Z ]{0,40}PRIVATE KEY-----/g;
+  let out = "";
+  let pos = 0;
+  for (;;) {
+    HEAD.lastIndex = pos;
+    const b = HEAD.exec(s);
+    if (!b) break;
+    TAIL.lastIndex = b.index + b[0].length;
+    const e = TAIL.exec(s);
+    if (!e) break; // no END after this BEGIN, so none after any later BEGIN either
+    out += s.slice(pos, b.index) + "[REDACTED:private_key]";
+    pos = e.index + e[0].length;
+  }
+  return pos === 0 ? s : out + s.slice(pos);
+}
+
+// "Basic <base64 of user:password>": short values count only when they decode to a user:password pair, so ordinary
+// phrases such as "Basic plan" are left alone.
+function isCredential(scheme: string, token: string): boolean {
+  const bare = token.replace(/=+$/, "");
+  if (bare.length >= 8) return true;
+  if (scheme.toLowerCase() !== "basic") return false;
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(token) || token.length % 4 !== 0) return false;
+  return /^[\x20-\x7e]*:[\x20-\x7e]*$/.test(Buffer.from(token, "base64").toString("latin1"));
+}
+
 export function redactString(s: string): string {
   if (!enabled || typeof s !== "string" || s.length < 6) return s;
   if (!MAYBE.test(s) && !custom.length) return s;
   let out = s;
   const before = out;
-  out = out.replace(PRIVATE_KEY, "[REDACTED:private_key]");
+  out = maskPrivateKeys(out);
   out = out.replace(JWT, "[REDACTED:jwt]");
-  out = out.replace(BEARER, (_m, scheme) => `${scheme} [REDACTED:bearer]`);
+  out = out.replace(BEARER, (m, scheme, token) => (isCredential(scheme, token) ? `${scheme} [REDACTED:bearer]` : m));
   out = out.replace(AWS_KEY, "[REDACTED:aws_key]");
   out = out.replace(SECRET_PAIR, (_m, k, sep) => `${k}${sep}[REDACTED:secret]`);
   out = out.replace(CARD, (m) => {
@@ -105,17 +136,16 @@ export function redactObject<T extends Record<string, any>>(o: T): T {
   for (const k of Object.keys(o)) {
     const v = o[k];
     if (typeof v === "string") (o as any)[k] = secretKey(k) && v.length ? "[REDACTED:key]" : redactString(v);
-    else if (v && typeof v === "object") {
-      if (secretKey(k) && !Array.isArray(v)) (o as any)[k] = "[REDACTED:key]";
-      else redactObject(v);
-    }
+    else if (secretKey(k) && (typeof v === "number" || typeof v === "bigint" || (v && typeof v === "object"))) (o as any)[k] = "[REDACTED:key]";
+    else if (v && typeof v === "object") redactObject(v);
   }
   return o;
 }
 
-export function redactLog<L extends { message: string; attributes: Record<string, any>; tags?: string[] }>(l: L): L {
+export function redactLog<L extends { message: string; attributes: Record<string, any>; tags?: string[]; service?: string }>(l: L): L {
   if (!enabled) return l;
   l.message = redactString(l.message);
+  if (typeof l.service === "string") l.service = redactString(l.service);
   redactObject(l.attributes);
   if (l.tags)
     l.tags = l.tags.map((t) => {
@@ -125,9 +155,11 @@ export function redactLog<L extends { message: string; attributes: Record<string
   return l;
 }
 
-export function redactSpan<S extends { resource: string; meta?: Record<string, string> }>(s: S): S {
+export function redactSpan<S extends { resource: string; meta?: Record<string, string>; name?: string; service?: string }>(s: S): S {
   if (!enabled) return s;
   s.resource = redactString(s.resource);
+  if (typeof s.name === "string") s.name = redactString(s.name);
+  if (typeof s.service === "string") s.service = redactString(s.service);
   if (s.meta) redactObject(s.meta);
   return s;
 }

@@ -50,7 +50,7 @@ jobs:
       - name: Start DataCat
         run: |
           for i in $(seq 1 60); do curl -fsS http://localhost:8123/ping > /dev/null && break; sleep 1; done
-          PORT=3000 NODE_ENV=production SESSION_SECRET=ci-only-session-secret-0123456789abcdef node artifacts/api-server/dist/index.mjs > server.log 2>&1 &
+          PORT=3000 NODE_ENV=production PUBLIC_URL=http://localhost:3000 SESSION_SECRET=ci-only-session-secret-0123456789abcdef node artifacts/api-server/dist/index.mjs > server.log 2>&1 &
       - name: End-to-end known-answer checks
         run: bash scripts/e2e.sh
       - name: Server log

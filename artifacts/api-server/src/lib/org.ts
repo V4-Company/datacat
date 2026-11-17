@@ -30,7 +30,7 @@ export async function orgForApiKey(key: string | undefined | null): Promise<numb
   const [row] = await db
     .select()
     .from(apiKeysTable)
-    .where(and(eq(apiKeysTable.key, key), eq(apiKeysTable.revoked, false)));
+    .where(and(eq(apiKeysTable.key, key), eq(apiKeysTable.kind, "api"), eq(apiKeysTable.revoked, false)));
   if (!row) return null;
   keyCache.set(key, { orgId: row.orgId, kind: row.kind, at: Date.now() });
   db.update(apiKeysTable)

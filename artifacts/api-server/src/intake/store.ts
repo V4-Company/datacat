@@ -288,6 +288,8 @@ export async function writeLogs(orgId: number, logs: LogIn[]) {
   for (const l of logs) {
     if (typeof l.message === "string") l.message = cut(stripAnsi(l.message), MAX_MESSAGE);
     limitValues(l.attributes);
+    if (Array.isArray(l.tags)) l.tags = l.tags.slice(0, MAX_ATTRS).map((t) => (typeof t === "string" ? cut(t, MAX_VALUE) : t));
+    if (typeof l.service === "string") l.service = cut(l.service, 1000);
     redactLog(l);
     if (l.service) l.service = l.service.toLowerCase();
   }
@@ -366,6 +368,8 @@ export async function writeSpans(orgId: number, spans: SpanIn[]) {
   for (const s of spans) {
     limitValues(s.meta);
     if (s.resource) s.resource = cut(s.resource, 5000);
+    if (typeof s.name === "string") s.name = cut(s.name, 1000);
+    if (typeof s.service === "string") s.service = cut(s.service, 1000);
     redactSpan(s);
     if (s.service) s.service = s.service.toLowerCase();
     if (s.env) s.env = s.env.toLowerCase();

@@ -22,8 +22,8 @@ const ROUTES = [
 const rnd = (a: number, b: number) => a + Math.random() * (b - a);
 const id = () => BigInt.asUintN(63, crypto.randomBytes(8).readBigUInt64BE()).toString();
 
-async function tick(orgId: number, t0: number) {
-  const now = Math.floor(Date.now() / 1000);
+async function tick(orgId: number, t0: number, nowMs = Date.now()) {
+  const now = Math.floor(nowMs / 1000);
   const phase = (now - t0) / 600;
   const series: PointIn[] = [];
   for (const [i, h] of HOSTS.entries()) {
@@ -53,7 +53,7 @@ async function tick(orgId: number, t0: number) {
     const host = r.svc === "storefront" ? HOSTS[Math.floor(Math.random() * 2)].name : "api-01";
     const traceId = id(),
       rootId = id();
-    const startNs = (Date.now() - Math.floor(rnd(0, 14000))) * 1e6;
+    const startNs = (nowMs - Math.floor(rnd(0, 14000))) * 1e6;
     const err = Math.random() < (r.err ?? 0.01);
     const dur = (r.base + rnd(0, r.base)) * (err ? 2 : 1) * 1e6;
     const dbDur = dur * rnd(0.2, 0.5);
@@ -135,7 +135,7 @@ async function tick(orgId: number, t0: number) {
   }
   if (Math.random() < 0.3)
     logs.push({
-      ts: Date.now(),
+      ts: nowMs,
       status: "warn",
       service: "postgres",
       host: "db-01",
@@ -148,7 +148,17 @@ async function tick(orgId: number, t0: number) {
   await writeSpans(orgId, spans);
 }
 
-export async function startSampleData(orgId: number, minutes = 60) {
+const starting = new Map<number, Promise<{ until: number }>>();
+/** Starts sample data for an organization; a second call while one is starting returns the same result. */
+export function startSampleData(orgId: number, minutes = 60): Promise<{ until: number }> {
+  const cur = starting.get(orgId);
+  if (cur) return cur;
+  const p = startSampleDataNow(orgId, minutes).finally(() => starting.delete(orgId));
+  starting.set(orgId, p);
+  return p;
+}
+
+async function startSampleDataNow(orgId: number, minutes: number) {
   stopSampleData(orgId);
   for (const h of HOSTS)
     await touchHost(
@@ -167,15 +177,7 @@ export async function startSampleData(orgId: number, minutes = 60) {
   const t0 = Math.floor(Date.now() / 1000);
   // backfill the last 30 minutes so graphs have history
   const now = Date.now();
-  const realNow = Date.now;
-  try {
-    for (let back = 30 * 60; back > 0; back -= 60) {
-      Date.now = () => now - back * 1000;
-      await tick(orgId, t0 - back);
-    }
-  } finally {
-    Date.now = realNow;
-  }
+  for (let back = 30 * 60; back > 0; back -= 60) await tick(orgId, t0 - back, now - back * 1000);
   const end = Date.now() + minutes * 60_000;
   const iv = setInterval(() => {
     if (Date.now() > end) return stopSampleData(orgId);

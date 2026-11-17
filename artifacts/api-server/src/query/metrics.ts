@@ -59,6 +59,8 @@ export function parseFilter(s: string): FilterNode | null {
   const src = s.trim();
   if (!src || src === "*") return null;
   const toks = tokenizeFilter(src);
+  for (const t of toks)
+    if ((t.match(/[*?]/g)?.length ?? 0) > MAX_WILDCARDS) throw new HttpError(400, `A tag filter may use at most ${MAX_WILDCARDS} wildcards`);
   let p = 0;
   const peek = () => toks[p];
   function parseOr(): FilterNode {
@@ -129,25 +131,36 @@ export function parseFilter(s: string): FilterNode | null {
   return parseOr();
 }
 
-function globToRe(g: string): RegExp {
-  return new RegExp(
-    "^" +
-      g
-        .replace(/[.+^${}()|[\]\\]/g, "\\$&")
-        .replace(/\*/g, ".*")
-        .replace(/\?/g, ".") +
-      "$",
-    "i",
-  );
-}
-const reCache = new Map<string, RegExp>();
-function globMatch(pattern: string, v: string) {
+const isLineBreak = (c: number) => c === 10 || c === 13 || c === 0x2028 || c === 0x2029;
+/**
+ * Case-insensitive glob match ("*" any run of characters, "?" one character; neither crosses a line break). Greedy
+ * matching that backs up only to the most recent "*", so the cost stays proportional to pattern × value length.
+ */
+export function globMatch(pattern: string, v: string) {
   if (pattern === "*") return true;
-  if (!pattern.includes("*") && !pattern.includes("?")) return pattern.toLowerCase() === v.toLowerCase();
-  let re = reCache.get(pattern);
-  if (!re) reCache.set(pattern, (re = globToRe(pattern)));
-  return re.test(v);
+  const p = pattern.toLowerCase();
+  const s = v.toLowerCase();
+  if (!p.includes("*") && !p.includes("?")) return p === s;
+  let i = 0,
+    j = 0,
+    star = -1,
+    mark = 0;
+  while (j < s.length) {
+    if (i < p.length && p[i] !== "*" && (p[i] === s[j] || (p[i] === "?" && !isLineBreak(s.charCodeAt(j))))) {
+      i++;
+      j++;
+    } else if (i < p.length && p[i] === "*") {
+      star = i++;
+      mark = j;
+    } else if (star >= 0 && !isLineBreak(s.charCodeAt(mark))) {
+      i = star + 1;
+      j = ++mark;
+    } else return false;
+  }
+  while (i < p.length && p[i] === "*") i++;
+  return i === p.length;
 }
+const MAX_WILDCARDS = 20;
 
 const normTag = (v: string) => v.toLowerCase().replace(/[^a-z0-9_:./\-*?]+/g, "_");
 
@@ -440,7 +453,7 @@ function spaceAggregate(agg: string, vs: number[]): number {
 }
 
 function fillSeries(set: SeriesSet, mode: string, from: number, to: number, interval: number) {
-  if (mode === "null") return;
+  if (mode === "null" || !(interval > 0)) return;
   for (const s of set) {
     let last: number | undefined;
     for (let b = Math.floor(from / interval) * interval; b < to; b += interval) {
@@ -733,9 +746,18 @@ export interface QueryResultSeries {
   interval: number; // bucket width in seconds
 }
 
+const MAX_BUCKETS = 10_000;
+/** Bucket width in seconds: a requested interval must be a positive number; it is widened to at most MAX_BUCKETS buckets. */
+export function resolveInterval(requested: unknown, from: number, to: number): number {
+  if (requested === undefined || requested === null) return pickInterval(from, to);
+  const n = Number(requested);
+  if (!Number.isFinite(n) || n <= 0) throw new HttpError(400, "interval must be a positive number of seconds");
+  return Math.max(1, Math.round(n), Math.ceil((to - from) / MAX_BUCKETS) || 1);
+}
+
 /** Run a set of named queries + formulas (v2 timeseries style). Supports inline arithmetic in a query. */
 export async function runQueries(orgId: number, req: QueryRequest): Promise<{ series: QueryResultSeries[]; interval: number }> {
-  const interval = req.interval ?? pickInterval(req.from, req.to);
+  const interval = resolveInterval(req.interval, req.from, req.to);
   const env: Record<string, SeriesSet> = {};
   const exprs: Record<string, string> = {};
   for (const q of req.queries) {

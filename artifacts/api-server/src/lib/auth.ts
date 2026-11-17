@@ -56,9 +56,8 @@ export async function clearSession(res: Response, sid?: string): Promise<void> {
   res.clearCookie(SESSION_COOKIE, { path: "/" });
 }
 
+// Sessions come only from the (signed) cookie; the raw session id is never accepted as a token.
 export function getSessionId(req: Request): string | undefined {
-  const authHeader = req.headers["authorization"];
-  if (authHeader?.startsWith("Bearer ")) return authHeader.slice(7);
   return process.env.SESSION_SECRET ? req.signedCookies?.[SESSION_COOKIE] || undefined : req.cookies?.[SESSION_COOKIE];
 }
 

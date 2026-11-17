@@ -185,9 +185,10 @@ async function evaluateValues(orgId: number, p: Parsed, noData = false): Promise
   return out;
 }
 
-function render(
+export function render(
   template: string,
   ctx: { state: State; prev: State; value: number | null; threshold: number; warn?: number; tags: string[]; name: string; id: number },
+  sectionsOnly = false,
 ) {
   const isAlert = ctx.state === "Alert",
     isWarn = ctx.state === "Warn",
@@ -202,6 +203,7 @@ function render(
     is_warning_recovery: isRecovery && ctx.prev === "Warn",
   };
   let s = template.replace(/\{\{([#^])(\w+)\}\}([\s\S]*?)\{\{\/\2\}\}/g, (_m, kind, flag, inner) => ((kind === "#") === !!flags[flag] ? inner : ""));
+  if (sectionsOnly) return s;
   const tagVals: Record<string, string> = {};
   for (const t of ctx.tags) {
     const i = t.indexOf(":");
@@ -218,8 +220,14 @@ function render(
   return s;
 }
 
-async function notify(orgId: number, monitorId: number, message: string, title: string, payload: any) {
-  const handles = [...new Set([...message.matchAll(/@([A-Za-z0-9_\-.@]+)/g)].map((m) => m[1]))];
+/** Notification handles (@webhook-x, @slack-y, @someone) written in a monitor message. */
+export function messageHandles(template: string): string[] {
+  return [...new Set([...template.matchAll(/@([A-Za-z0-9_\-.@]+)/g)].map((m) => m[1]))];
+}
+
+// handles come from the monitor's own template (see evaluateMonitorNow), so telemetry values inserted into the
+// message cannot add recipients.
+async function notify(orgId: number, monitorId: number, message: string, title: string, payload: any, handles: string[]) {
   const now = Date.now();
   const channels = (await pool.query("select * from notification_channels where org_id=$1", [orgId])).rows;
   const clean = message.replace(/@(webhook|slack)-[A-Za-z0-9_\-]+/g, "").trim();
@@ -290,7 +298,13 @@ export async function retryNotifications(): Promise<number> {
       [now, now + 60_000],
     )
   ).rows;
-  for (const n of rows) {
+  // Retries run in parallel, so one slow destination does not hold up the rest of the batch.
+  await Promise.all(rows.map((n) => retryOne(n)));
+  return rows.length;
+}
+
+async function retryOne(n: any) {
+  {
     const attempts = Number(n.attempts) + 1;
     const name = String(n.channel).replace(/^@(webhook|slack)-/, "");
     const ch = (await pool.query("select * from notification_channels where org_id=$1 and name=$2", [n.org_id, name])).rows[0];
@@ -299,7 +313,7 @@ export async function retryNotifications(): Promise<number> {
         n.id,
         "Channel was deleted before delivery",
       ]);
-      continue;
+      return;
     }
     const r = await deliver(ch, n.payload);
     if (r.ok)
@@ -322,7 +336,6 @@ export async function retryNotifications(): Promise<number> {
         Date.now() + RETRY_BACKOFF_MS[attempts - 1],
       ]);
   }
-  return rows.length;
 }
 
 const inFlight = new Map<number, Promise<void>>();
@@ -409,6 +422,7 @@ async function evaluateMonitorNow(id: number) {
     };
     const title = `[${label}${t.tags.length ? " on " + t.tags.join(",") : ""}] ${render(mon.name, ctx)}`;
     const text = render(mon.message ?? "", ctx);
+    const handles = messageHandles(render(mon.message ?? "", ctx, true));
     await pool.query(
       "insert into events (org_id, ts, title, text, alert_type, source, monitor_id, group_key, tags) values ($1,$2,$3,$4,$5,'monitor',$6,$7,$8)",
       [
@@ -423,18 +437,25 @@ async function evaluateMonitorNow(id: number) {
       ],
     );
     if (!muted) {
-      await notify(mon.org_id, mon.id, text, title, {
-        monitor_id: mon.id,
-        monitor_name: mon.name,
-        transition: `${t.from} -> ${t.to}`,
-        state: t.to,
-        value: t.value,
-        threshold: ctx.threshold,
-        group: t.key,
-        tags: t.tags,
-        query: mon.query,
-        date: new Date(now).toISOString(),
-      });
+      await notify(
+        mon.org_id,
+        mon.id,
+        text,
+        title,
+        {
+          monitor_id: mon.id,
+          monitor_name: mon.name,
+          transition: `${t.from} -> ${t.to}`,
+          state: t.to,
+          value: t.value,
+          threshold: ctx.threshold,
+          group: t.key,
+          tags: t.tags,
+          query: mon.query,
+          date: new Date(now).toISOString(),
+        },
+        handles,
+      );
     }
   }
   await pool.query("update monitors set overall_state=$2, group_states=$3, last_evaluated_at=$4, last_triggered_at=$5 where id=$1", [
@@ -446,18 +467,24 @@ async function evaluateMonitorNow(id: number) {
   ]);
 }
 
-let running = false;
+// Each organization's monitors run in their own chain, so a slow notification destination in one organization never
+// delays monitoring for the others. A chain still running from the previous tick is not started again.
+const orgRuns = new Map<number, Promise<void>>();
 export function startMonitorLoop() {
   const tick = async () => {
-    if (running) return;
-    running = true;
     try {
-      const rows = (await pool.query("select id from monitors")).rows;
-      for (const r of rows) await evaluateMonitor(r.id).catch((e) => logger.warn({ err: String(e), id: r.id }, "monitor eval failed"));
+      const rows = (await pool.query("select id, org_id from monitors order by org_id, id")).rows;
+      const byOrg = new Map<number, number[]>();
+      for (const r of rows) byOrg.set(r.org_id, [...(byOrg.get(r.org_id) ?? []), r.id]);
+      for (const [orgId, ids] of byOrg) {
+        if (orgRuns.has(orgId)) continue;
+        const run = (async () => {
+          for (const id of ids) await evaluateMonitor(id).catch((e) => logger.warn({ err: String(e), id }, "monitor eval failed"));
+        })().finally(() => orgRuns.delete(orgId));
+        orgRuns.set(orgId, run);
+      }
     } catch (e) {
       logger.warn({ err: String(e) }, "monitor loop failed");
-    } finally {
-      running = false;
     }
   };
   setInterval(tick, 30_000);
