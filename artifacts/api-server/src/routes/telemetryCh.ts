@@ -3,7 +3,7 @@ import { serviceSummary, serviceTimeseries, serviceResources, serviceOperations,
 import { chQuery, ChParams } from "../lib/ch";
 import { hostMetricsCh } from "../query/metricsCh";
 import { logWhereCh, spanWhereCh } from "../query/searchCh";
-import { v2Search, v2Page, parseAggregate, toBuckets, aggregateInterval, limitBuckets, PERCENTILE, type AggregateRequest } from "../query/v2";
+import { v2Search, v2Page, parseAggregate, toBuckets, limitBuckets, PERCENTILE, type AggregateRequest, aggregatePasses, mergeBuckets } from "../query/v2";
 import { filterHosts } from "../query/hosts";
 import { spanV2 } from "./telemetry";
 import { correlate } from "../query/correlate";
@@ -95,7 +95,7 @@ router.post(
         type: "timeseries_response",
         attributes: {
           times,
-          series: r.series.map((s, i) => ({ query_index: i, group_tags: s.group, unit: null })),
+          series: r.series.map((s) => ({ query_index: s.queryIndex, group_tags: s.group, unit: null })),
           values: r.series.map((s) => {
             const m = new Map(s.pointlist);
             return times.map((t) => m.get(t) ?? null);
@@ -392,7 +392,7 @@ function aggregateComputeSql(c: AggregateRequest["computes"][number], b: ChParam
   const metric = c.metric!;
   if (c.aggregation === "cardinality") return `toFloat64(uniqExact(${facetExpr(metric, b)}))`;
   const x = `toFloat64OrNull(attrs[${b.p(metric.replace(/^@/, ""))}])`;
-  if (c.aggregation in PERCENTILE) return `quantileExact(${PERCENTILE[c.aggregation]})(${x})`;
+  if (c.aggregation in PERCENTILE) return `quantileExactInclusive(${PERCENTILE[c.aggregation]})(${x})`;
   return `${c.aggregation}(${x})`;
 }
 router.post(
@@ -400,18 +400,21 @@ router.post(
   h(async (req, res) => {
     const started = Date.now();
     const a = parseAggregate(req.body);
-    const { where, b } = logWhere(req.orgId!, a.query, a.from, a.to);
-    const groups = a.groupBy.map((g, i) => `${facetExpr(g.facet, b)} AS g${i}`);
-    const computes = a.computes.map((c) => `${aggregateComputeSql(c, b)} AS ${c.name}`);
-    const interval = aggregateInterval(a, (f, t) => pickInterval(f, t, 60));
-    const ts = a.computes.some((c) => c.timeseries);
-    const sel = [...groups, ...(ts ? [`intDiv(ts, ${interval * 1000}) * ${interval} AS t`] : []), ...computes];
-    const by = [...a.groupBy.map((_, i) => `g${i}`), ...(ts ? ["t"] : [])];
-    const rows = await chQuery(
-      `SELECT ${sel.join(", ")} FROM logs WHERE ${where} ${by.length ? `GROUP BY ${by.join(", ")}` : ""} ${ts ? "ORDER BY t" : ""} LIMIT 100000`,
-      b.params,
-    );
-    res.json({ data: { buckets: limitBuckets(a, toBuckets(a, rows)) }, meta: { status: "done", elapsed: Date.now() - started } });
+    const parts = [];
+    for (const pass of aggregatePasses(a, (f, t) => pickInterval(f, t, 60))) {
+      const { where, b } = logWhere(req.orgId!, a.query, a.from, a.to);
+      const groups = a.groupBy.map((g, i) => `${facetExpr(g.facet, b)} AS g${i}`);
+      const computes = pass.computes.map((c) => `${aggregateComputeSql(c, b)} AS ${c.name}`);
+      const ts = pass.interval !== null;
+      const sel = [...groups, ...(ts ? [`intDiv(ts, ${pass.interval! * 1000}) * ${pass.interval} AS t`] : []), ...computes];
+      const by = [...a.groupBy.map((_, i) => `g${i}`), ...(ts ? ["t"] : [])];
+      const rows = await chQuery(
+        `SELECT ${sel.join(", ")} FROM logs WHERE ${where} ${by.length ? `GROUP BY ${by.join(", ")}` : ""} ${ts ? "ORDER BY t" : ""} LIMIT 100000`,
+        b.params,
+      );
+      parts.push(toBuckets({ ...a, computes: pass.computes }, rows));
+    }
+    res.json({ data: { buckets: limitBuckets(a, mergeBuckets(parts)) }, meta: { status: "done", elapsed: Date.now() - started } });
   }),
 );
 

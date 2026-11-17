@@ -35,7 +35,7 @@ export async function aggregateCh(
   return chQuery(
     `SELECT g, b, ${spaceCol} AS v FROM (
       SELECT series_id, intDiv(ts, ${step}) * ${step} AS b, ${timeCol} AS v FROM metric_points
-      WHERE org_id = ${b.p(orgId, "UInt32")} AND metric = ${b.p(metric)} AND ts >= ${b.p(Math.floor(from / step) * step, "UInt32")} AND ts < ${b.p(to, "UInt32")}
+      WHERE org_id = ${b.p(orgId, "UInt32")} AND metric = ${b.p(metric)} AND ts >= ${b.p(from, "UInt32")} AND ts < ${b.p(to, "UInt32")}
         AND series_id IN (SELECT id FROM sel) GROUP BY series_id, b
     ) AS p INNER JOIN sel ON sel.id = p.series_id GROUP BY g, b ORDER BY g, b`,
     b.params,
@@ -54,18 +54,20 @@ export async function aggregateDistributionCh(
   from: number,
   to: number,
 ) {
-  const col = agg.startsWith("p:")
-    ? `quantileExact(${Number(agg.slice(2))})(value)`
-    : (({ sum: "sum(value)", min: "min(value)", max: "max(value)", count: "toFloat64(count())" } as Record<string, string>)[agg] ?? "avg(value)");
+  // agg "values": one row per distinct value with its total weight (percentiles are computed by the caller)
+  const col =
+    agg === "values"
+      ? "p.value AS v, sum(p.weight) AS w"
+      : `${({ sum: "sum(p.value * p.weight)", min: "min(p.value)", max: "max(p.value)", count: "sum(p.weight)" } as Record<string, string>)[agg] ?? "sum(p.value * p.weight) / nullIf(sum(p.weight), 0)"} AS v`;
   const b = new ChParams();
   const tsv = ids.map((id, i) => `${id}\t${groups[i]}`).join("\n");
   return chQuery(
-    `SELECT sel.g AS g, intDiv(p.ts, ${step}) * ${step} AS b, ${col} AS v FROM metric_points AS p INNER JOIN sel ON sel.id = p.series_id
-    WHERE p.org_id = ${b.p(orgId, "UInt32")} AND p.metric = ${b.p(metric)} AND p.ts >= ${b.p(Math.floor(from / step) * step, "UInt32")} AND p.ts < ${b.p(to, "UInt32")}
-    GROUP BY g, b ORDER BY g, b`,
+    `SELECT sel.g AS g, intDiv(p.ts, ${step}) * ${step} AS b, ${col} FROM metric_points AS p INNER JOIN sel ON sel.id = p.series_id
+    WHERE p.org_id = ${b.p(orgId, "UInt32")} AND p.metric = ${b.p(metric)} AND p.ts >= ${b.p(from, "UInt32")} AND p.ts < ${b.p(to, "UInt32")}
+    GROUP BY g, b${agg === "values" ? ", p.value" : ""} ORDER BY g, b`,
     b.params,
     { external: [{ name: "sel", structure: "id UInt64, g UInt32", tsv }] },
-  ) as Promise<{ g: number; b: number; v: number }[]>;
+  ) as Promise<{ g: number; b: number; v: number; w?: number }[]>;
 }
 
 export async function listMetricsCh(orgId: number, search: string, limit: number) {

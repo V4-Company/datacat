@@ -6,6 +6,7 @@ import { storage, useClickHouse } from "./lib/storage";
 import { ensureChSchema } from "./lib/ch";
 import { pool } from "@workspace/db";
 import { generatedSetupToken } from "./routes/auth";
+import { flushSpanStats } from "./query/apmStats";
 
 const rawPort = process.env["PORT"] ?? "3000";
 const port = Number(rawPort);
@@ -17,7 +18,7 @@ logger.info({ storage }, "telemetry storage");
 if (generatedSetupToken && !(await pool.query("select 1 from users limit 1")).rowCount) {
   logger.warn(`First-run setup token (enter it on the setup page): ${generatedSetupToken}`);
 }
-app.listen(port, (err) => {
+const server = app.listen(port, (err) => {
   if (err) {
     logger.error({ err }, "Error listening on port");
     process.exit(1);
@@ -31,3 +32,25 @@ app.listen(port, (err) => {
     void buildBackgroundIndexes((msg, extra) => logger.info(extra ?? {}, msg));
   } else logger.info("background jobs disabled (DATACAT_BACKGROUND_JOBS=false)");
 });
+
+// On SIGTERM/SIGINT: stop accepting connections, let requests in progress finish (up to DATACAT_SHUTDOWN_SECONDS,
+// default 25), flush pending APM rollups, close the database pool, then exit.
+let stopping = false;
+for (const sig of ["SIGTERM", "SIGINT"] as const)
+  process.once(sig, () => {
+    if (stopping) return;
+    stopping = true;
+    logger.info({ signal: sig }, "shutting down");
+    const limitMs = Math.max(1, Number(process.env.DATACAT_SHUTDOWN_SECONDS ?? 25)) * 1000;
+    const force = setTimeout(() => {
+      logger.warn("shutdown time limit reached; exiting");
+      process.exit(0);
+    }, limitMs);
+    force.unref();
+    server.close(async () => {
+      await flushSpanStats().catch((e) => logger.warn({ err: e }, "final span stats flush failed"));
+      await pool.end().catch(() => undefined);
+      process.exit(0);
+    });
+    server.closeIdleConnections?.();
+  });

@@ -88,6 +88,10 @@ ALTER TABLE notification_log ADD COLUMN IF NOT EXISTS attempts integer NOT NULL 
 ALTER TABLE notification_log ADD COLUMN IF NOT EXISTS next_attempt_at bigint;
 CREATE INDEX IF NOT EXISTS notification_log_retry ON notification_log(next_attempt_at) WHERE status = 'retrying';
 `,
+  // 3: weighted distribution points (Datadog Agent sketches store each bin as one value with its count); NULL means 1
+  `
+ALTER TABLE metric_points ADD COLUMN IF NOT EXISTS weight double precision;
+`,
 ];
 
 export async function migrateDatabase() {

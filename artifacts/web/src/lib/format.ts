@@ -6,7 +6,10 @@ export function fmtNum(v: number | null | undefined, digits = 2): string {
   if (a >= 1e6) return (v / 1e6).toFixed(1) + "M";
   if (a >= 1e4) return (v / 1e3).toFixed(1) + "K";
   if (a >= 100) return v.toFixed(0);
-  if (a >= 1) return v.toFixed(digits).replace(/\.?0+$/, "");
+  if (a >= 1) {
+    const s = v.toFixed(digits);
+    return s.includes(".") ? s.replace(/\.?0+$/, "") : s;
+  }
   if (a === 0) return "0";
   return v.toPrecision(2);
 }

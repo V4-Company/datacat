@@ -65,7 +65,6 @@ export function LogsExplorer() {
   const [groupBy, setGroupBy] = useState("service");
   const [sel, setSel] = useState<LogRow | null>(null);
   const [liveRows, setLiveRows] = useState<LogRow[]>([]);
-  const lastLive = useRef<number>(Date.now() - 60_000);
   const effFrom = live ? Math.floor(Date.now() / 1000) - 900 : from;
   const effTo = live ? Math.floor(Date.now() / 1000) + 5 : to;
   const list = useQuery({
@@ -95,23 +94,43 @@ export function LogsExplorer() {
   useEffect(() => {
     if (!live) return;
     setLiveRows([]);
-    lastLive.current = Date.now() - 30_000;
+    // The position is the API cursor (time and id of the last log seen), so a burst of logs with one timestamp is read
+    // page by page instead of repeating the first page. Requests from an older query are aborted and their results
+    // dropped.
+    const ctl = new AbortController();
+    const since = Math.floor((Date.now() - 30_000) / 1000);
+    let cursor: string | null = null;
+    let busy = false;
     const poll = async () => {
-      const now = Math.floor(Date.now() / 1000) + 2;
-      const r = await api<{ logs: LogRow[] }>("/ui/logs/search", {
-        body: { query, from: Math.floor(lastLive.current / 1000), to: now, limit: 200, sort: "asc" },
-      }).catch(() => null);
-      if (r?.logs.length) {
-        setLiveRows((rows) => {
-          const ids = new Set(rows.map((x) => x.id));
-          return [...r.logs.filter((l) => !ids.has(l.id)).reverse(), ...rows].slice(0, 500);
-        });
-        lastLive.current = r.logs[r.logs.length - 1].ts;
+      if (busy || ctl.signal.aborted) return;
+      busy = true;
+      try {
+        for (let page = 0; page < 10 && !ctl.signal.aborted; page++) {
+          const r: { logs: LogRow[]; cursor: string | null } | null = await api<{ logs: LogRow[]; cursor: string | null }>("/ui/logs/search", {
+            body: { query, from: since, to: Math.floor(Date.now() / 1000) + 2, limit: 200, sort: "asc", ...(cursor ? { cursor } : {}) },
+            signal: ctl.signal,
+          }).catch(() => null);
+          if (!r || ctl.signal.aborted) return;
+          if (r.logs.length) {
+            const last = r.logs[r.logs.length - 1];
+            cursor = `${last.ts}_${last.id}`;
+            setLiveRows((rows) => {
+              const ids = new Set(rows.map((x) => x.id));
+              return [...r.logs.filter((l) => !ids.has(l.id)).reverse(), ...rows].slice(0, 500);
+            });
+          }
+          if (!r.cursor) break;
+        }
+      } finally {
+        busy = false;
       }
     };
     poll();
     const iv = setInterval(poll, 2000);
-    return () => clearInterval(iv);
+    return () => {
+      clearInterval(iv);
+      ctl.abort();
+    };
   }, [live, query]);
 
   const histData = useMemo(() => {

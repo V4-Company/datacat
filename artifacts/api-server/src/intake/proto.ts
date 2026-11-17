@@ -46,6 +46,8 @@ const descriptor = {
                 max: { type: "double", id: 4 },
                 avg: { type: "double", id: 5 },
                 sum: { type: "double", id: 6 },
+                k: { rule: "repeated", type: "sint32", id: 7 },
+                n: { rule: "repeated", type: "uint32", id: 8 },
               },
             },
           },

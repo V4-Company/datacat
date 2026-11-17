@@ -16,6 +16,21 @@ export class HttpError extends Error {
  * their message. Database errors never reach the caller: invalid input caught by the database is a generic 400, and
  * anything else is logged and answered with a generic 500.
  */
+const NET_CODES = new Set(["ECONNREFUSED", "ECONNRESET", "ETIMEDOUT", "EPIPE", "ENOTFOUND", "EAI_AGAIN", "EHOSTUNREACH", "UND_ERR_SOCKET"]);
+/**
+ * True for a temporary storage failure (database or ClickHouse unavailable, connection or server error), which intake
+ * answers with 503 so agents retry. PostgreSQL data errors (classes 22 and 23) are the payload's fault, not storage's.
+ */
+export function isStorageError(err: any, depth = 0): boolean {
+  if (!err || depth > 3) return false;
+  const code = typeof err.code === "string" ? err.code : "";
+  const msg = String(err.message ?? "");
+  if (/^[0-9A-Z]{5}$/.test(code)) return !/^2[23]/.test(code);
+  if (NET_CODES.has(code) || /^ClickHouse[: ]/.test(msg) || msg === "fetch failed") return true;
+  if (/Connection terminated|timeout exceeded when trying to connect|Client has encountered a connection error/i.test(msg)) return true;
+  return isStorageError(err.cause, depth + 1);
+}
+
 export const h = (fn: (req: Request, res: Response) => Promise<unknown>) => (req: Request, res: Response) => {
   fn(req, res).catch((e: any) => {
     if (res.headersSent) return;

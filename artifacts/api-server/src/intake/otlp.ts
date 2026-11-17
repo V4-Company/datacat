@@ -380,8 +380,15 @@ function rememberCumulative(k: string, v: any) {
     }
   }
 }
-function cumKey(orgId: number, name: string, host: string, tags: string[], start: any) {
-  return `${orgId}|${name}|${host}|${tags.join(",")}|${start ?? ""}`;
+const sortedAttrs = (a: Attrs) =>
+  JSON.stringify(
+    Object.entries(a)
+      .filter(([, v]) => v !== null && v !== undefined)
+      .sort(([x], [y]) => (x < y ? -1 : x > y ? 1 : 0)),
+  );
+/** Identity of one cumulative stream: every resource, scope and data-point attribute (order-independent) and its start. */
+function cumKey(orgId: number, name: string, resource: string, scope: string, dpAttrs: Attrs, start: any) {
+  return `${orgId}|${name}|${resource}|${scope}|${sortedAttrs(dpAttrs)}|${start ?? ""}`;
 }
 
 function quantileFromBuckets(bounds: number[], counts: number[], q: number, min?: number, max?: number): number {
@@ -402,13 +409,25 @@ function quantileFromBuckets(bounds: number[], counts: number[], q: number, min?
   return max ?? bounds[bounds.length - 1] ?? NaN;
 }
 
-function expoToExplicit(dp: any): { bounds: number[]; counts: number[] } {
+/**
+ * Exponential histogram -> explicit buckets in ascending order. Bucket i of a range covers (base^(offset+i),
+ * base^(offset+i+1)] in absolute value; negative buckets mirror it below zero, the zero bucket sits between.
+ */
+export function expoToExplicit(dp: any): { bounds: number[]; counts: number[] } {
   const scale = Number(dp.scale ?? 0);
   const base = Math.pow(2, Math.pow(2, -scale));
+  const bounds: number[] = [];
+  const counts: number[] = [];
+  const noff = Number(dp.negative?.offset ?? 0);
+  const nc = (dp.negative?.bucketCounts ?? []).map(Number);
+  for (let i = nc.length - 1; i >= 0; i--) {
+    bounds.push(-Math.pow(base, noff + i));
+    counts.push(nc[i]);
+  }
+  bounds.push(0);
+  counts.push(Number(dp.zeroCount ?? 0));
   const off = Number(dp.positive?.offset ?? 0);
   const pc = (dp.positive?.bucketCounts ?? []).map(Number);
-  const bounds: number[] = [0];
-  const counts: number[] = [Number(dp.zeroCount ?? 0)];
   pc.forEach((c: number, i: number) => {
     bounds.push(Math.pow(base, off + i + 1));
     counts.push(c);
@@ -492,8 +511,18 @@ function hostMappings(
   }
 }
 
-export function otlpToMetrics(orgId: number, req: any): { points: PointIn[]; hosts: Map<string, { os?: string; agentVersion?: string; tags: string[] }> } {
+/**
+ * Converts an OTLP metrics request. Cumulative streams are turned into deltas against the last stored value; the new
+ * reference values are applied only by commit(), which the caller runs after the points are stored, so a failed store
+ * followed by a retry computes the same deltas again instead of losing them.
+ */
+export function otlpToMetrics(
+  orgId: number,
+  req: any,
+): { points: PointIn[]; hosts: Map<string, { os?: string; agentVersion?: string; tags: string[] }>; commit: () => void } {
   const out: PointIn[] = [];
+  const refs = new Map<string, any>();
+  const refOf = (k: string) => (refs.has(k) ? refs.get(k) : cumulative.get(k));
   const hosts = new Map<string, { os?: string; agentVersion?: string; tags: string[] }>();
   const acc = new Map<string, { sum: number; n: number; p: PointIn }>();
   for (const rm of req?.resourceMetrics ?? []) {
@@ -506,7 +535,9 @@ export function otlpToMetrics(orgId: number, req: any): { points: PointIn[]; hos
         tags: r.tags,
       });
     const baseTags = [...r.tags, ...(r.service ? [`service:${r.service}`] : [])];
+    const resKey = sortedAttrs(r.attrs);
     for (const sm of rm.scopeMetrics ?? []) {
+      const scopeKey = `${sm.scope?.name ?? ""}@${sm.scope?.version ?? ""}`;
       for (const m of sm.metrics ?? []) {
         const name = String(m.name ?? "");
         if (!name) continue;
@@ -547,9 +578,10 @@ export function otlpToMetrics(orgId: number, req: any): { points: PointIn[]; hos
               continue;
             }
             if (!delta) {
-              const k = cumKey(orgId, name, r.host, tags, dp.startTimeUnixNano);
-              const prev = cumulative.get(k);
-              rememberCumulative(k, { v, ts });
+              const k = cumKey(orgId, name, resKey, scopeKey, a, dp.startTimeUnixNano);
+              const prev = refOf(k);
+              if (prev !== undefined && ts < prev.ts) continue; // late or retried older sample: already counted
+              refs.set(k, { v, ts });
               if (prev === undefined || v < prev.v) continue; // first sample or reset
               const dt = Math.max(1, ts - prev.ts);
               const d = v - prev.v;
@@ -577,10 +609,13 @@ export function otlpToMetrics(orgId: number, req: any): { points: PointIn[]; hos
               ? { bounds: (dp.explicitBounds ?? []).map(Number), counts: (dp.bucketCounts ?? []).map(Number) }
               : expoToExplicit(dp);
             if (!delta) {
-              const k = cumKey(orgId, name, r.host, tags, dp.startTimeUnixNano);
-              const prev = cumulative.get(k);
-              rememberCumulative(k, { count, sum, counts });
-              if (!prev || count < prev.count) continue;
+              const k = cumKey(orgId, name, resKey, scopeKey, attrs(dp.attributes), dp.startTimeUnixNano);
+              const prev = refOf(k);
+              if (prev && ts < prev.ts) continue;
+              refs.set(k, { count, sum, counts, bounds, ts });
+              // buckets are subtracted range by range; a change of bucket layout starts a new reference
+              const sameLayout = prev && prev.bounds.length === bounds.length && prev.bounds.every((b: number, i: number) => b === bounds[i]);
+              if (!prev || !sameLayout || count < prev.count) continue;
               count -= prev.count;
               sum -= prev.sum;
               counts = counts.map((c: number, i: number) => c - (prev.counts[i] ?? 0));
@@ -617,19 +652,33 @@ export function otlpToMetrics(orgId: number, req: any): { points: PointIn[]; hos
     out.push(e.p);
   }
   // derived ratios the Infrastructure list uses
-  const byHostTs = new Map<string, Record<string, number>>();
+  const byHostTs = new Map<string, { host: string; ts: number; device: string[]; v: Record<string, number> }>();
   for (const p of out)
     if (/^system\.(mem\.(usable|total)|disk\.(used|total))$/.test(p.metric)) {
-      const k = `${p.host}|${p.points[0][0]}|${p.tags.filter((t) => t.startsWith("device:")).join(",")}`;
-      (byHostTs.get(k) ?? byHostTs.set(k, {}).get(k)!)[p.metric] = p.points[0][1];
+      const device = p.tags.filter((t) => t.startsWith("device:"));
+      const k = JSON.stringify([p.host, p.points[0][0], device]);
+      let e = byHostTs.get(k);
+      if (!e) byHostTs.set(k, (e = { host: p.host, ts: p.points[0][0], device, v: {} }));
+      e.v[p.metric] = p.points[0][1];
     }
-  for (const [k, v] of byHostTs) {
-    const [host, ts] = k.split("|");
+  for (const { host, ts, device, v } of byHostTs.values()) {
     const tags = hosts.get(host)?.tags ?? [];
     if (v["system.mem.total"])
-      out.push({ metric: "system.mem.pct_usable", host, tags, type: "gauge", points: [[Number(ts), (v["system.mem.usable"] ?? 0) / v["system.mem.total"]]] });
+      out.push({ metric: "system.mem.pct_usable", host, tags, type: "gauge", points: [[ts, (v["system.mem.usable"] ?? 0) / v["system.mem.total"]]] });
     if (v["system.disk.total"])
-      out.push({ metric: "system.disk.in_use", host, tags, type: "gauge", points: [[Number(ts), (v["system.disk.used"] ?? 0) / v["system.disk.total"]]] });
+      out.push({
+        metric: "system.disk.in_use",
+        host,
+        tags: [...tags, ...device],
+        type: "gauge",
+        points: [[ts, (v["system.disk.used"] ?? 0) / v["system.disk.total"]]],
+      });
   }
-  return { points: out, hosts };
+  return {
+    points: out,
+    hosts,
+    commit: () => {
+      for (const [k, v] of refs) rememberCumulative(k, v);
+    },
+  };
 }

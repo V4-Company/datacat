@@ -94,7 +94,7 @@ export async function chInsert(table: string, rows: object[]) {
     }),
     { method: "POST", headers: auth(), body },
   );
-  if (!res.ok) throw new Error(`ClickHouse insert into ${table}: ${(await res.text()).slice(0, 500)}`);
+  if (!res.ok) throw new Error(`ClickHouse: insert into ${table}: ${(await res.text()).slice(0, 500)}`);
   await res.arrayBuffer();
 }
 
@@ -133,7 +133,8 @@ const DDL = [
     unit LowCardinality(String), last_seen UInt32
   ) ENGINE = ${engine("ReplacingMergeTree", "last_seen")} ORDER BY (org_id, metric, series_id)`,
   `CREATE TABLE IF NOT EXISTS ${DB}.metric_points${onCluster} (
-    org_id UInt32, metric LowCardinality(String), series_id UInt64, host LowCardinality(String), ts UInt32 CODEC(Delta, ZSTD(1)), value Float64 CODEC(Gorilla, ZSTD(1))
+    org_id UInt32, metric LowCardinality(String), series_id UInt64, host LowCardinality(String), ts UInt32 CODEC(Delta, ZSTD(1)), value Float64 CODEC(Gorilla, ZSTD(1)),
+    weight Float64 DEFAULT 1 CODEC(ZSTD(1))
   ) ENGINE = ${engine("MergeTree")} PARTITION BY toYYYYMMDD(toDateTime(ts)) ORDER BY (org_id, metric, series_id, ts)
   ${ttl("toDateTime(ts)")}`,
   // Per-minute APM rollups, maintained by ClickHouse itself from top-level spans (the same log-scale histogram
@@ -160,6 +161,8 @@ export function ensureChSchema(): Promise<void> {
     ready = (async () => {
       // the database itself must be created without ?database= (it does not exist yet)
       for (const sql of DDL) await chQuery(sql, {}, { noDb: sql.startsWith("CREATE DATABASE") });
+      // installs created before weighted distribution points
+      await chQuery(`ALTER TABLE ${DB}.metric_points${onCluster} ADD COLUMN IF NOT EXISTS weight Float64 DEFAULT 1 CODEC(ZSTD(1))`);
       // keep TTLs in step with DATACAT_RETENTION_DAYS when it changes between restarts
       for (const [t, e] of [
         ["spans", "toDateTime(intDiv(start_ms, 1000))"],

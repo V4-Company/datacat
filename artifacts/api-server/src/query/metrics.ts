@@ -420,7 +420,7 @@ export async function runMetricQuery(
           p as (select series_id, (ts / $3) * $3 as b, ${col} as v from metric_points
                 where series_id = any($1) and ts >= $4 and ts < $5 group by 1, 2)
      select s.g, p.b, ${spaceCol} as v from p join s on s.id = p.series_id group by 1, 2 order by 1, 2`,
-        [matched.map((m) => m.id), gOf, rollInterval, Math.floor(from / rollInterval) * rollInterval, to],
+        [matched.map((m) => m.id), gOf, rollInterval, from, to],
       );
   // as_rate / as_count scaling is linear, so applying it after sum/avg/min/max equals applying it per series
   const scale = q.spaceAgg === "count" ? 1 : type === "count" && asRate ? 1 / rollInterval : type === "rate" && asCount ? rollInterval : 1;
@@ -497,17 +497,26 @@ async function runDistributionQuery(
   to: number,
 ): Promise<SeriesSet> {
   const pct = percentileOf(q.spaceAgg);
-  const agg = pct !== null ? `p:${pct}` : q.spaceAgg;
-  const rows = useClickHouse
-    ? await aggregateDistributionCh(orgId, q.metric, ids, g.gOf, agg, step, from, to)
-    : (
-        await pool.query(
-          `with s as (select * from unnest($1::int[], $2::int[]) as s(id, g))
-         select s.g, (p.ts / $3) * $3 as b, ${pct !== null ? `percentile_cont(${pct}) within group (order by p.value)` : (({ sum: "sum(p.value)", min: "min(p.value)", max: "max(p.value)", count: "count(*)::double precision" } as Record<string, string>)[q.spaceAgg] ?? "avg(p.value)")} as v
-         from metric_points p join s on s.id = p.series_id where p.series_id = any($1) and p.ts >= $4 and p.ts < $5 group by 1, 2 order by 1, 2`,
-          [ids, g.gOf, step, Math.floor(from / step) * step, to],
-        )
-      ).rows;
+  const agg = pct !== null ? "values" : q.spaceAgg;
+  let rows: { g: number; b: number; v: number }[];
+  if (useClickHouse) rows = await aggregateDistributionCh(orgId, q.metric, ids, g.gOf, agg, step, from, to);
+  else {
+    const w = "coalesce(p.weight, 1)";
+    const col =
+      agg === "values"
+        ? `p.value as v, sum(${w}) as w`
+        : `${({ sum: `sum(p.value * ${w})`, min: "min(p.value)", max: "max(p.value)", count: `sum(${w})::double precision` } as Record<string, string>)[agg] ?? `sum(p.value * ${w}) / nullif(sum(${w}), 0)`} as v`;
+    rows = (
+      await pool.query(
+        `with s as (select * from unnest($1::int[], $2::int[]) as s(id, g))
+         select s.g, (p.ts / $3) * $3 as b, ${col}
+         from metric_points p join s on s.id = p.series_id where p.series_id = any($1) and p.ts >= $4 and p.ts < $5
+         group by 1, 2${agg === "values" ? ", p.value" : ""} order by 1, 2`,
+        [ids, g.gOf, step, from, to],
+      )
+    ).rows;
+  }
+  if (pct !== null) rows = weightedPercentileRows(rows as any, pct);
   const byGroup = new Map<number, Map<number, number>>();
   for (const r of rows as { g: number; b: number; v: number }[]) {
     let m = byGroup.get(Number(r.g));
@@ -543,10 +552,15 @@ function binop(op: string, a: Val, b: Val): Val {
   if (additive && A.length === 0) return op === "+" ? B : B.map((s) => mapPoints(s, (v) => -v));
   const out: SeriesSet = [];
   const bIndex = new Map(B.map((s) => [s.key, s]));
-  const bAll = B.length === 1 ? B[0] : undefined;
+  // An ungrouped series ("*") applies to every group of the other side; grouped series combine only when their group
+  // keys are equal. For + and -, a group present on one side only is kept (the missing side counts as 0).
+  const bAll = B.length === 1 && B[0].key === "*" ? B[0] : undefined;
+  const aAll = A.length === 1 && A[0].key === "*" ? A[0] : undefined;
+  const empty: Series = { key: "", tags: [], points: new Map() };
   for (const sa of A) {
-    const sb =
-      bIndex.get(sa.key) ?? (bAll && (bAll.key === "*" || A.length === 1) ? bAll : undefined) ?? (A.length === 1 && sa.key === "*" ? undefined : undefined);
+    let sb = bIndex.get(sa.key) ?? bAll;
+    if (!sb && aAll && B.length > 1) break; // handled below: A is ungrouped, B is grouped
+    if (!sb && additive) sb = { ...empty, key: sa.key, tags: sa.tags };
     if (!sb) continue;
     const pts = new Map<number, number>();
     for (const [t, v] of sa.points) {
@@ -564,7 +578,19 @@ function binop(op: string, a: Val, b: Val): Val {
         }
     out.push({ key: sa.key, tags: sa.tags.length ? sa.tags : sb.tags, points: pts });
   }
-  if (A.length === 1 && A[0].key === "*" && B.length > 1) {
+  if (additive && !aAll && !bAll) {
+    const aKeys = new Set(A.map((s) => s.key));
+    for (const sb of B)
+      if (!aKeys.has(sb.key)) {
+        const pts = new Map<number, number>();
+        for (const [t, w] of sb.points) {
+          const r = f(0, w);
+          if (Number.isFinite(r)) pts.set(t, r);
+        }
+        out.push({ key: sb.key, tags: sb.tags, points: pts });
+      }
+  }
+  if (aAll && B.length > 1) {
     return B.map((sb) => {
       const pts = new Map<number, number>();
       for (const [t, w] of sb.points) {
@@ -705,8 +731,51 @@ export function evalFormula(formula: string, env: Record<string, SeriesSet>, int
   return typeof v === "number" ? [] : v;
 }
 
+/**
+ * Percentile per (group, bucket) of weighted values, with the same interpolation as percentile_cont over the values
+ * repeated by their weights. Rows are (g, b, v, w), one per distinct value.
+ */
+export function weightedPercentileRows(rows: { g: number; b: number; v: number; w: number }[], q: number): { g: number; b: number; v: number }[] {
+  const cells = new Map<string, { g: number; b: number; vs: [number, number][] }>();
+  for (const r of rows) {
+    const k = `${r.g}|${r.b}`;
+    let c = cells.get(k);
+    if (!c) cells.set(k, (c = { g: Number(r.g), b: Number(r.b), vs: [] }));
+    c.vs.push([Number(r.v), Number(r.w)]);
+  }
+  const out: { g: number; b: number; v: number }[] = [];
+  for (const c of cells.values()) {
+    c.vs.sort((x, y) => x[0] - y[0]);
+    const total = c.vs.reduce((a, x) => a + x[1], 0);
+    if (!(total > 0)) continue;
+    const r = q * (total - 1);
+    const at = (pos: number) => {
+      let cum = 0;
+      for (const [v, w] of c.vs) {
+        cum += w;
+        if (cum > pos) return v;
+      }
+      return c.vs[c.vs.length - 1][0];
+    };
+    const lo = at(Math.floor(r));
+    out.push({ g: c.g, b: c.b, v: lo + (at(Math.ceil(r)) - lo) * (r - Math.floor(r)) });
+  }
+  return out.sort((x, y) => x.g - y.g || x.b - y.b);
+}
+
+/** Linear interpolation between closest ranks (the method of PostgreSQL's percentile_cont). */
+export function interpolatedPercentile(vs: number[], q: number): number {
+  const s = [...vs].sort((a, b) => a - b);
+  const r = q * (s.length - 1);
+  const lo = Math.floor(r);
+  return s[lo] + (s[Math.min(s.length - 1, lo + 1)] - s[lo]) * (r - lo);
+}
+
+/** Reduce the values of a window, in time order. agg "pNN" is the NNth percentile. */
 export function reduce(vs: number[], agg: string): number {
   if (!vs.length) return NaN;
+  const pm = /^p(\d{1,2}(?:\.\d+)?)$/.exec(agg);
+  if (pm && agg !== "p95") return interpolatedPercentile(vs, Number(pm[1]) / 100);
   switch (agg) {
     case "sum":
       return vs.reduce((a, b) => a + b, 0);
@@ -718,11 +787,13 @@ export function reduce(vs: number[], agg: string): number {
       return vs[vs.length - 1];
     case "count":
       return vs.length;
+    case "change":
+      return vs[vs.length - 1] - vs[0];
+    case "pct_change":
+      return vs[0] === 0 ? NaN : ((vs[vs.length - 1] - vs[0]) / Math.abs(vs[0])) * 100;
     case "percentile":
-    case "p95": {
-      const s = [...vs].sort((a, b) => a - b);
-      return s[Math.min(s.length - 1, Math.floor(s.length * 0.95))];
-    }
+    case "p95":
+      return interpolatedPercentile(vs, 0.95);
     default:
       return vs.reduce((a, b) => a + b, 0) / vs.length;
   }
@@ -738,6 +809,8 @@ export interface QueryRequest {
 }
 
 export interface QueryResultSeries {
+  /** index of the formula (or query, when there are no formulas) this series belongs to */
+  queryIndex: number;
   name: string;
   alias?: string;
   formula: string;
@@ -760,22 +833,35 @@ export async function runQueries(orgId: number, req: QueryRequest): Promise<{ se
   const interval = resolveInterval(req.interval, req.from, req.to);
   const env: Record<string, SeriesSet> = {};
   const exprs: Record<string, string> = {};
+  const raws: Record<string, string> = {};
   for (const q of req.queries) {
     if (!q.query?.trim()) continue;
     const { formula, queries } = extractInlineQueries(q.query.trim(), `__q_${q.name.replace(/\W/g, "")}_`);
-    for (const [n, raw] of Object.entries(queries)) env[n] = await runMetricQuery(orgId, parseMetricQuery(raw), req.from, req.to, interval, req.vars);
+    for (const [n, raw] of Object.entries(queries)) {
+      raws[n] = raw;
+      env[n] = await runMetricQuery(orgId, parseMetricQuery(raw), req.from, req.to, interval, req.vars);
+    }
     exprs[q.name] = formula;
   }
+  // Operands of a formula must share one bucket size: when a .rollup() widened some query, the others are re-run at
+  // that width (from raw data, with their own aggregation) instead of being matched point by point.
+  let widest = interval;
+  for (const set of Object.values(env)) for (const s of set) if (s.interval && s.interval > widest) widest = s.interval;
+  if (widest > interval)
+    for (const [n, raw] of Object.entries(raws))
+      if (env[n].some((s) => (s.interval ?? interval) < widest))
+        env[n] = await runMetricQuery(orgId, parseMetricQuery(raw), req.from, req.to, widest, req.vars);
   for (const [name, f] of Object.entries(exprs)) env[name] = /^__q\w+$/.test(f.trim()) && env[f.trim()] ? env[f.trim()] : evalFormula(f, env, interval);
   const formulas = req.formulas?.length ? req.formulas : req.queries.filter((q) => q.query?.trim()).map((q) => ({ formula: q.name, alias: undefined }));
   // The reported interval is the widest bucket actually used (a .rollup(…, N) can widen it past the default).
   let effective = interval;
   for (const set of Object.values(env)) for (const s of set) if (s.interval && s.interval > effective) effective = s.interval;
   const series: QueryResultSeries[] = [];
-  for (const f of formulas) {
+  for (const [fi, f] of formulas.entries()) {
     const set = evalFormula(f.formula, env, effective);
     for (const s of set) {
       series.push({
+        queryIndex: fi,
         name: f.formula,
         alias: f.alias,
         formula: f.formula,

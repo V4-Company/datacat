@@ -24,7 +24,7 @@ export default function App() {
           <Switch>
             <Route path="/" component={Home} />
             <Route path="/dashboard/lists" component={DashboardList} />
-            <Route path="/dashboard/:id">{() => <DashboardView />}</Route>
+            <Route path="/dashboard/:id">{(p: { id: string }) => <DashboardView key={p.id} />}</Route>
             <Route path="/infrastructure" component={InfraList} />
             <Route path="/infrastructure/map" component={HostMap} />
             <Route path="/metric/explorer" component={MetricsExplorer} />

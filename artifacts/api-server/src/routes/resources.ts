@@ -10,6 +10,7 @@ import { newKey, invalidateKey } from "../lib/org";
 import { evaluateMonitor, validateMonitorQuery } from "../jobs/monitors";
 import { startSampleData, stopSampleData, sampleRunning } from "../jobs/sample";
 import { intakeStats } from "../lib/intakeStats";
+import { logger } from "../lib/logger";
 
 const router: Router = Router();
 router.use(
@@ -31,6 +32,16 @@ function intId(v: unknown, what: string): number {
 const monitorId = (v: unknown) => intId(v, "monitor");
 const userName = (req: Request) => [req.authUser?.firstName, req.authUser?.lastName].filter(Boolean).join(" ") || req.authUser?.email || "API";
 
+/**
+ * LIMIT/OFFSET for list routes that accept paging (dashboards: count/start; monitors: page_size/page, page counted from
+ * 0). Without the parameters the full list is returned, as before.
+ */
+function listPage(q: any, sizeKey: string, posKey: string): string {
+  if (q?.[sizeKey] === undefined && q?.[posKey] === undefined) return "";
+  const size = pageLimit(q[sizeKey], 100, 1000);
+  const pos = Math.max(0, Math.floor(Number(q[posKey] ?? 0)) || 0);
+  return `limit ${size} offset ${posKey === "page" ? pos * size : pos}`;
+}
 function dashOut(r: any) {
   return {
     id: r.id,
@@ -54,7 +65,7 @@ router.get(
   h(async (req, res) => {
     const rows = (
       await pool.query(
-        "select id, title, description, layout_type, author_name, created_at, modified_at, jsonb_array_length(coalesce(definition->'widgets','[]'::jsonb)) as n from dashboards where org_id=$1 order by modified_at desc",
+        `select id, title, description, layout_type, author_name, created_at, modified_at, jsonb_array_length(coalesce(definition->'widgets','[]'::jsonb)) as n from dashboards where org_id=$1 order by modified_at desc, id ${listPage(req.query, "count", "start")}`,
         [req.orgId],
       )
     ).rows;
@@ -85,6 +96,18 @@ router.get(
     res.json(dashOut(r));
   }),
 );
+/** Validates the parts of a dashboard the UI relies on: widgets and template_variables must be lists of objects. */
+function checkDashboard(b: any) {
+  if (b.title !== undefined && (typeof b.title !== "string" || !b.title.trim())) throw new HttpError(400, "title must be a non-empty string");
+  for (const k of ["widgets", "template_variables"]) {
+    const v = b[k];
+    if (v === undefined || v === null) continue;
+    if (!Array.isArray(v)) throw new HttpError(400, `${k} must be a list`);
+    if (v.some((x: unknown) => !x || typeof x !== "object" || Array.isArray(x))) throw new HttpError(400, `each entry of ${k} must be an object`);
+  }
+  for (const t of b.template_variables ?? []) if (typeof t.name !== "string" || !t.name) throw new HttpError(400, "each template variable needs a name");
+  for (const w of b.widgets ?? []) if (!w.definition || typeof w.definition !== "object") throw new HttpError(400, "each widget needs a definition object");
+}
 function assignWidgetIds(ws: any[]) {
   for (const w of ws ?? []) {
     if (!w.id) w.id = crypto.randomInt(1, 2 ** 47);
@@ -97,6 +120,7 @@ router.post(
   h(async (req, res) => {
     const b = req.body ?? {};
     if (!b.title) throw new Error("title is required");
+    checkDashboard(b);
     const id = dashId();
     const def = { widgets: assignWidgetIds(b.widgets ?? []), template_variables: b.template_variables ?? [], reflow_type: b.reflow_type };
     const r = (
@@ -112,19 +136,32 @@ router.put(
   "/v1/dashboard/:id",
   h(async (req, res) => {
     const b = req.body ?? {};
-    const cur = (await pool.query("select definition, description from dashboards where org_id=$1 and id=$2", [req.orgId, req.params.id])).rows[0];
-    const prev = cur?.definition ?? {};
-    const def = {
-      widgets: b.widgets !== undefined ? assignWidgetIds(b.widgets ?? []) : (prev.widgets ?? []),
-      template_variables: b.template_variables ?? prev.template_variables ?? [],
-      reflow_type: b.reflow_type ?? prev.reflow_type,
-    };
-    const r = (
-      await pool.query(
-        "update dashboards set title=coalesce($3,title), description=$4, layout_type=coalesce($5,layout_type), definition=$6, modified_at=now() where org_id=$1 and id=$2 returning *",
-        [req.orgId, req.params.id, b.title ?? null, b.description !== undefined ? b.description : (cur?.description ?? null), b.layout_type ?? null, def],
-      )
-    ).rows[0];
+    checkDashboard(b);
+    // read-merge-write under a row lock, so two concurrent partial updates both keep their changes
+    const c = await pool.connect();
+    let r: any;
+    try {
+      await c.query("BEGIN");
+      const cur = (await c.query("select definition, description from dashboards where org_id=$1 and id=$2 for update", [req.orgId, req.params.id])).rows[0];
+      const prev = cur?.definition ?? {};
+      const def = {
+        widgets: b.widgets !== undefined ? assignWidgetIds(b.widgets ?? []) : (prev.widgets ?? []),
+        template_variables: b.template_variables ?? prev.template_variables ?? [],
+        reflow_type: b.reflow_type ?? prev.reflow_type,
+      };
+      r = (
+        await c.query(
+          "update dashboards set title=coalesce($3,title), description=$4, layout_type=coalesce($5,layout_type), definition=$6, modified_at=now() where org_id=$1 and id=$2 returning *",
+          [req.orgId, req.params.id, b.title ?? null, b.description !== undefined ? b.description : (cur?.description ?? null), b.layout_type ?? null, def],
+        )
+      ).rows[0];
+      await c.query("COMMIT");
+    } catch (e) {
+      await c.query("ROLLBACK").catch(() => undefined);
+      throw e;
+    } finally {
+      c.release();
+    }
     if (!r) {
       res.status(404).json({ errors: ["Dashboard not found"] });
       return;
@@ -165,7 +202,7 @@ function monOut(r: any) {
 router.get(
   "/v1/monitor",
   h(async (req, res) => {
-    const rows = (await pool.query("select * from monitors where org_id=$1 order by name", [req.orgId])).rows;
+    const rows = (await pool.query(`select * from monitors where org_id=$1 order by name, id ${listPage(req.query, "page_size", "page")}`, [req.orgId])).rows;
     res.json(rows.map(monOut));
   }),
 );
@@ -200,7 +237,7 @@ router.post(
         [req.orgId, b.name, type, b.query, b.message ?? "", b.tags ?? [], b.priority ?? null, b.options ?? {}, req.authUser?.id ?? null, userName(req)],
       )
     ).rows[0];
-    evaluateMonitor(r.id).catch(() => {});
+    evaluateMonitor(r.id).catch((e) => logger.warn({ err: String(e), id: r.id }, "monitor evaluation after create failed"));
     res.json(monOut(r));
   }),
 );
@@ -208,7 +245,15 @@ router.put(
   "/v1/monitor/:id",
   h(async (req, res) => {
     const b = req.body ?? {};
-    if (b.query) validateMonitorQuery(b.type ?? "metric alert", b.query);
+    const cur = (await pool.query("select type, query, priority from monitors where org_id=$1 and id=$2", [req.orgId, monitorId(req.params.id)])).rows[0];
+    if (!cur) {
+      res.status(404).json({ errors: ["Monitor not found"] });
+      return;
+    }
+    // the monitor as it will be saved must be valid, whichever fields the request changes
+    if (b.query !== undefined && !String(b.query ?? "").trim()) throw new HttpError(400, "query cannot be empty");
+    if (b.name !== undefined && !String(b.name ?? "").trim()) throw new HttpError(400, "name cannot be empty");
+    validateMonitorQuery(b.type ?? cur.type, b.query ?? cur.query);
     const r = (
       await pool.query(
         `update monitors set name=coalesce($3,name), type=coalesce($4,type), query=coalesce($5,query), message=coalesce($6,message), tags=coalesce($7,tags),
@@ -221,7 +266,7 @@ router.put(
           b.query ?? null,
           b.message ?? null,
           b.tags ?? null,
-          b.priority ?? null,
+          b.priority !== undefined ? b.priority : cur.priority,
           b.options ?? null,
         ],
       )
@@ -230,7 +275,7 @@ router.put(
       res.status(404).json({ errors: ["Monitor not found"] });
       return;
     }
-    evaluateMonitor(r.id).catch(() => {});
+    evaluateMonitor(r.id).catch((e) => logger.warn({ err: String(e), id: r.id }, "monitor evaluation after update failed"));
     res.json(monOut(r));
   }),
 );

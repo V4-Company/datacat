@@ -16,6 +16,38 @@ from opentelemetry.trace import NonRecordingSpan, SpanContext, SpanKind, Status,
 _patched = False
 
 
+class _ClosingBody:
+    """Iterates a WSGI response body inside the request span and ends the span once, on close or exhaustion."""
+
+    def __init__(self, body, span, finish):
+        self._body = body
+        self._span = span
+        self._finish = finish
+        self._done = False
+
+    def __iter__(self):
+        token = otel_context.attach(trace.set_span_in_context(self._span))
+        try:
+            for chunk in self._body:
+                yield chunk
+        except BaseException as exc:
+            self._span.record_exception(exc)
+            self._span.set_status(Status(StatusCode.ERROR))
+            raise
+        finally:
+            otel_context.detach(token)
+
+    def close(self):
+        try:
+            close = getattr(self._body, "close", None)
+            if close is not None:
+                close()
+        finally:
+            if not self._done:
+                self._done = True
+                self._finish()
+
+
 def _parent_from(environ):
     tp = environ.get("HTTP_TRACEPARENT")
     if not tp or len(tp) < 55:
@@ -60,18 +92,24 @@ def patch_flask():
                 pass
             return start_response(s, headers, exc_info)
 
-        try:
-            return original_wsgi_app(self, environ, _start_response)
-        except BaseException as exc:
-            span.record_exception(exc)
-            raise
-        finally:
+        def finish():
             code = status[0]
             span.set_attribute("http.response.status_code", code)
             if code >= 500:
                 span.set_status(Status(StatusCode.ERROR))
             span.end()
+
+        try:
+            body = original_wsgi_app(self, environ, _start_response)
+        except BaseException as exc:
+            span.record_exception(exc)
+            finish()
             otel_context.detach(token)
+            raise
+        otel_context.detach(token)
+        # The span covers the whole response: it ends when the server has consumed or closed the body, so streamed
+        # responses (downloads, server-sent events) report their real duration and errors.
+        return _ClosingBody(body, span, finish)
 
     def dispatch_request(self, *args, **kwargs):
         try:

@@ -7,6 +7,7 @@ import { writeMetrics, touchHost, writeLogs, writeSpans, type PointIn, type LogI
 import { orgForApiKey } from "../lib/org";
 import { decodeOtlp, encodeEmptyResponse, otlpToSpans, otlpToLogs, otlpToMetrics, type OtlpSignal } from "./otlp";
 import { logger } from "../lib/logger";
+import { isStorageError } from "../lib/http";
 import { pool } from "@workspace/db";
 
 const router: Router = Router();
@@ -38,6 +39,37 @@ export function raw(req: Request, res: Response, next: NextFunction) {
 
 const TYPE_V2: Record<number, string> = { 0: "gauge", 1: "count", 2: "rate", 3: "gauge" };
 
+// The Datadog Agent's sketch bins (its default configuration: relative accuracy 1/128, minimum value 1e-9). Bin key k
+// covers [γ^(k-bias), γ^(k-bias+1)); negative keys mirror it below zero, key 0 is zero.
+const SKETCH_GAMMA = 1 + 2 / 128;
+const SKETCH_BIAS = -Math.floor(Math.log(1e-9) / Math.log1p(2 / 128)) + 1;
+export function sketchBinValue(k: number): number {
+  if (k === 0) return 0;
+  const lo = Math.pow(SKETCH_GAMMA, Math.abs(k) - SKETCH_BIAS);
+  return Math.sign(k) * lo * ((1 + SKETCH_GAMMA) / 2);
+}
+/** One weighted point per sketch bin (value of the bin, clamped to the sketch's min/max), so counts and percentiles hold. */
+export function sketchPoints(dogsketches: any[]): [number, number, number][] {
+  const pts: [number, number, number][] = [];
+  for (const d of dogsketches) {
+    const ts = Number(d.ts);
+    const k: number[] = (d.k ?? []).map(Number);
+    const n: number[] = (d.n ?? []).map(Number);
+    const min = Number(d.min),
+      max = Number(d.max);
+    if (k.length && k.length === n.length) {
+      for (let i = 0; i < k.length; i++) {
+        if (!(n[i] > 0)) continue;
+        let v = sketchBinValue(k[i]);
+        if (Number.isFinite(min)) v = Math.max(v, min);
+        if (Number.isFinite(max)) v = Math.min(v, max);
+        pts.push([ts, v, n[i]]);
+      }
+    } else if (Number(d.cnt) > 0) pts.push([ts, Number(d.avg), Number(d.cnt)]);
+  }
+  return pts;
+}
+
 async function withOrg(req: Request, res: Response, next: NextFunction) {
   const orgId = await orgForApiKey(apiKeyFrom(req));
   if (!orgId) {
@@ -54,8 +86,7 @@ function wrap(fn: (req: Request, res: Response) => Promise<void>) {
   return (req: Request, res: Response) => {
     fn(req, res).catch((err) => {
       if (res.headersSent) return;
-      const fromDb =
-        (typeof err?.code === "string" && /^[0-9A-Z]{5}$/.test(err.code)) || /^ClickHouse:/.test(String(err?.message ?? "")) || err?.code === "ECONNREFUSED";
+      const fromDb = isStorageError(err);
       if (req.orgId) recordDrop(req.orgId, intakePath(req.path), 1, fromDb ? "storage error" : `rejected: ${String(err?.message ?? err).slice(0, 120)}`);
       if (fromDb) {
         logger.error({ err, path: req.path }, "intake storage error");
@@ -144,10 +175,8 @@ router.post(
   wrap(async (req, res) => {
     const p = decodeProto(SketchPayload, decompress(req));
     const series: PointIn[] = [];
-    for (const s of p.sketches ?? []) {
-      const pts: [number, number][] = (s.dogsketches ?? []).map((d: any) => [Number(d.ts), Number(d.avg)]);
-      series.push({ metric: s.metric, host: s.host ?? "", tags: s.tags ?? [], type: "distribution", points: pts });
-    }
+    for (const s of p.sketches ?? [])
+      series.push({ metric: s.metric, host: s.host ?? "", tags: s.tags ?? [], type: "distribution", points: sketchPoints(s.dogsketches ?? []) });
     await storeMetrics(req.orgId!, "metrics", series);
     res.status(202).json({});
   }),
@@ -432,13 +461,14 @@ function otlpRoute(signal: OtlpSignal) {
         n = logs.length;
         await writeLogs(orgId, logs);
       } else {
-        const { points, hosts } = otlpToMetrics(orgId, body);
+        const { points, hosts, commit } = otlpToMetrics(orgId, body);
         for (const [name, h] of hosts)
           await touchHost(orgId, name, { os: h.os, platform: h.os, agentVersion: h.agentVersion, tags: h.tags, apps: ["system"] }, true);
         const { valid, invalid } = splitPoints(points);
         if (invalid) recordDrop(orgId, path, invalid, "points without a numeric value");
         n = valid;
         await writeMetrics(orgId, points);
+        commit();
       }
     } catch (e) {
       logger.error({ err: e, signal }, "OTLP write failed");

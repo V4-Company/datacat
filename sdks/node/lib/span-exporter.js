@@ -251,20 +251,25 @@ class DataCatSpanExporter {
   // One POST; resolves { ok, retryable, retryAfterMs, error }.
   post(body) {
     return new Promise((resolve) => {
+      let settled = false;
+      const done = (r) => { if (!settled) { settled = true; resolve(r); } };
       const req = this.transport.request(this.url, {
         method: 'POST', agent: this.agent, timeout: this.timeout,
         headers: { ...this.headers, 'content-length': body.length },
       }, (res) => {
+        // A reset after the headers must count as a failed (retryable) attempt, not crash the application.
+        res.on('error', (error) => done({ ok: false, retryable: true, error }));
+        res.on('aborted', () => done({ ok: false, retryable: true, error: Object.assign(new Error('OTLP export response aborted'), { code: 'ECONNRESET' }) }));
         res.resume();
         res.on('end', () => {
           const code = res.statusCode;
-          if (code >= 200 && code < 300) return resolve({ ok: true });
+          if (code >= 200 && code < 300) return done({ ok: true });
           const ra = Number(res.headers['retry-after']);
-          resolve({ ok: false, retryable: RETRYABLE_STATUS.has(code), retryAfterMs: Number.isFinite(ra) ? ra * 1000 : 0, error: new Error(`OTLP export failed: HTTP ${code}`) });
+          done({ ok: false, retryable: RETRYABLE_STATUS.has(code), retryAfterMs: Number.isFinite(ra) ? ra * 1000 : 0, error: new Error(`OTLP export failed: HTTP ${code}`) });
         });
       });
       req.on('timeout', () => req.destroy(Object.assign(new Error('OTLP export timed out'), { code: 'ETIMEDOUT' })));
-      req.on('error', (error) => resolve({ ok: false, retryable: true, error }));
+      req.on('error', (error) => done({ ok: false, retryable: true, error }));
       req.end(body);
     });
   }

@@ -4,6 +4,7 @@ import { decompress } from "./decode";
 import { raw } from "./routes";
 import { writeSpans, writeMetrics, markTopLevel, type SpanIn, type PointIn } from "./store";
 import { orgForApiKey } from "../lib/org";
+import { isStorageError } from "../lib/http";
 import { logger } from "../lib/logger";
 
 /**
@@ -119,6 +120,11 @@ async function handleTraces(req: Request, res: Response, version: "v0.4" | "v0.5
     await writeSpans(orgId, spans);
     res.json({ rate_by_service: { "service:,env:": 1 } });
   } catch (err: any) {
+    if (isStorageError(err)) {
+      logger.error({ err }, "tracer intake storage error");
+      res.status(503).json({ error: "Temporarily unable to store data; retry later" });
+      return;
+    }
     logger.warn({ err: String(err?.message ?? err) }, "tracer intake error");
     res.status(err?.status === 413 ? 413 : 400).json({ error: String(err?.message ?? err) });
   }
@@ -181,6 +187,11 @@ for (const p of PREFIXES) {
       }
       res.status(accepted || !lines.length ? 202 : 403).json({ accepted });
     } catch (err: any) {
+      if (isStorageError(err)) {
+        logger.error({ err }, "dogstatsd intake storage error");
+        res.status(503).json({ error: "Temporarily unable to store data; retry later" });
+        return;
+      }
       res.status(err?.status === 413 ? 413 : 400).json({ error: String(err?.message ?? err) });
     }
   });

@@ -37,7 +37,7 @@ export function intakeStats(orgId: number): Record<string, PathStats> {
 }
 
 /** Points with a metric name and finite timestamp/value are stored; the rest are dropped. */
-export function splitPoints<T extends { metric?: string; points?: [number, number][] }>(series: T[]) {
+export function splitPoints<T extends { metric?: string; points?: number[][] }>(series: T[]) {
   let valid = 0;
   let invalid = 0;
   for (const s of series) {

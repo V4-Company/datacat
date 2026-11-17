@@ -15,8 +15,8 @@ import {
   evalFormula,
   type SeriesSet,
 } from "../query/metrics";
-import { compileSearch, logResolver, spanResolver, SqlBuilder, jsonPath } from "../query/search";
-import { v2Search, v2Page, parseAggregate, toBuckets, aggregateInterval, limitBuckets, PERCENTILE, type AggregateRequest } from "../query/v2";
+import { compileSearch, logResolver, spanResolver, SqlBuilder, jsonPath, safeNumber } from "../query/search";
+import { v2Search, v2Page, parseAggregate, toBuckets, aggregatePasses, mergeBuckets, limitBuckets, PERCENTILE, type AggregateRequest } from "../query/v2";
 import { filterHosts } from "../query/hosts";
 import { normalizeTraceId } from "../intake/decode";
 
@@ -91,7 +91,7 @@ router.post(
         type: "timeseries_response",
         attributes: {
           times,
-          series: r.series.map((s, i) => ({ query_index: i, group_tags: s.group, unit: null })),
+          series: r.series.map((s) => ({ query_index: s.queryIndex, group_tags: s.group, unit: null })),
           values: r.series.map((s) => {
             const m = new Map(s.pointlist);
             return times.map((t) => m.get(t) ?? null);
@@ -251,13 +251,16 @@ const likeEsc = (s: string) => s.replace(/[\\%_]/g, (m) => "\\" + m);
 /** SQL for a log facet (column, @attribute or tag key); keys are bound as parameters. */
 function logFacetSql(f: string, b: SqlBuilder): string {
   if (LOG_COLUMNS.includes(f)) return f;
-  if (f.startsWith("@")) return jsonPath("attributes", f.slice(1), b);
+  if (f.startsWith("@")) return logAttrSql(f.slice(1), b);
   return `(select substr(t, ${b.p(f.length + 2)}::int) from unnest(tags) t where t like ${b.p(likeEsc(f) + ":%")} limit 1)`;
+}
+/** A log attribute as text: a nested path (a.b.c) or a flat dotted key ("http.status_code"), as search resolves it. */
+function logAttrSql(key: string, b: SqlBuilder): string {
+  return `COALESCE(${jsonPath("attributes", key, b)}, attributes ->> ${b.p(key)}::text)`;
 }
 /** A numeric log attribute (non-numeric values become NULL instead of failing the query). */
 function logNumberSql(metric: string, b: SqlBuilder): string {
-  const x = jsonPath("attributes", metric.replace(/^@/, ""), b);
-  return `(CASE WHEN ${x} ~ '^-?[0-9]+(\\.[0-9]+)?([eE][-+]?[0-9]+)?$' THEN (${x})::double precision END)`;
+  return safeNumber(logAttrSql(metric.replace(/^@/, ""), b));
 }
 router.post(
   "/ui/logs/search",
@@ -403,20 +406,23 @@ router.post(
   h(async (req, res) => {
     const started = Date.now();
     const a = parseAggregate(req.body);
-    const { where, b } = logWhere(req.orgId!, a.query, a.from, a.to);
-    const groups = a.groupBy.map((g, i) => `${logFacetSql(g.facet, b)} as g${i}`);
-    const computes = a.computes.map((c) => `${aggregateComputeSql(c, b)} as ${c.name}`);
-    const interval = aggregateInterval(a, (f, t) => pickInterval(f, t, 60));
-    const ts = a.computes.some((c) => c.timeseries);
-    const sel = [...groups, ...(ts ? [`(ts / 1000 / ${interval}) * ${interval} as t`] : []), ...computes];
-    const by = [...a.groupBy.map((_, i) => i + 1), ...(ts ? [groups.length + 1] : [])];
-    const rows = (
-      await pool.query(
-        `select ${sel.join(", ")} from logs where ${where} ${by.length ? `group by ${by.join(",")}` : ""} ${ts ? "order by t" : ""} limit 100000`,
-        b.params,
-      )
-    ).rows;
-    res.json({ data: { buckets: limitBuckets(a, toBuckets(a, rows)) }, meta: { status: "done", elapsed: Date.now() - started } });
+    const parts = [];
+    for (const pass of aggregatePasses(a, (f, t) => pickInterval(f, t, 60))) {
+      const { where, b } = logWhere(req.orgId!, a.query, a.from, a.to);
+      const groups = a.groupBy.map((g, i) => `${logFacetSql(g.facet, b)} as g${i}`);
+      const computes = pass.computes.map((c) => `${aggregateComputeSql(c, b)} as ${c.name}`);
+      const ts = pass.interval !== null;
+      const sel = [...groups, ...(ts ? [`(ts / 1000 / ${pass.interval}) * ${pass.interval} as t`] : []), ...computes];
+      const by = [...a.groupBy.map((_, i) => i + 1), ...(ts ? [groups.length + 1] : [])];
+      const rows = (
+        await pool.query(
+          `select ${sel.join(", ")} from logs where ${where} ${by.length ? `group by ${by.join(",")}` : ""} ${ts ? "order by t" : ""} limit 100000`,
+          b.params,
+        )
+      ).rows;
+      parts.push(toBuckets({ ...a, computes: pass.computes }, rows));
+    }
+    res.json({ data: { buckets: limitBuckets(a, mergeBuckets(parts)) }, meta: { status: "done", elapsed: Date.now() - started } });
   }),
 );
 

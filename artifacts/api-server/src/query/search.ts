@@ -139,7 +139,7 @@ export function compileSearch(query: string, resolve: FieldResolver, b: SqlBuild
     const cmp = /^(>=|<=|>|<)(-?[\d.]+)([a-z]*)$/.exec(val);
     const range = /^\[(-?[\d.]+)([a-z]*)\s+TO\s+(-?[\d.]+)([a-z]*)\]$/i.exec(val);
     if (cmp || range) {
-      const num = f.numSql ?? `NULLIF(${f.sql}, '')::double precision`;
+      const num = f.numSql ?? safeNumber(f.sql);
       const conv = (n: string, unit: string) => {
         let x = Number(n);
         if (f.transformNum) x = f.transformNum(x);
@@ -183,6 +183,11 @@ export function compileSearch(query: string, resolve: FieldResolver, b: SqlBuild
 }
 
 /** Nested JSON lookup with the key bound as a parameter (never spliced into SQL). */
+/** A text expression as a number; values that are not numbers become NULL instead of failing the query. */
+export function safeNumber(x: string) {
+  return `(CASE WHEN (${x}) ~ '^\\s*-?([0-9]+\\.?[0-9]*|\\.[0-9]+)([eE][-+]?[0-9]+)?\\s*$' THEN (${x})::double precision END)`;
+}
+
 export function jsonPath(col: string, key: string, b: SqlBuilder) {
   return `${col} #>> ${b.p(key.split("."))}::text[]`;
 }
@@ -219,5 +224,5 @@ export const spanResolver: FieldResolver = (key, isAttr, b) => {
   }
   if (key === "duration") return { kind: "num", sql: "duration", numSql: "duration::double precision" };
   const k = `${b.p(key)}::text`;
-  return { kind: "json", sql: `COALESCE(meta ->> ${k}, metrics ->> ${k})`, numSql: `NULLIF(COALESCE(metrics ->> ${k}, meta ->> ${k}), '')::double precision` };
+  return { kind: "json", sql: `COALESCE(meta ->> ${k}, metrics ->> ${k})`, numSql: safeNumber(`COALESCE(metrics ->> ${k}, meta ->> ${k})`) };
 };

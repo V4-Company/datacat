@@ -1,3 +1,4 @@
+import { logger } from "./logger";
 import crypto from "crypto";
 import { db, orgsTable, usersTable, apiKeysTable } from "@workspace/db";
 import { and, eq } from "drizzle-orm";
@@ -36,7 +37,7 @@ export async function orgForApiKey(key: string | undefined | null): Promise<numb
   db.update(apiKeysTable)
     .set({ lastUsedAt: new Date() })
     .where(eq(apiKeysTable.id, row.id))
-    .catch(() => {});
+    .catch((e) => logger.debug({ err: String(e) }, "api key last_used_at update failed"));
   return row.orgId;
 }
 

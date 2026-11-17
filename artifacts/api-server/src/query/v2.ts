@@ -105,6 +105,39 @@ export function parseAggregate(body: any): AggregateRequest {
   return { query: String(filter.query ?? "*") || "*", from, to, computes, groupBy };
 }
 
+/**
+ * Splits computes into query passes: one for all totals (no time grouping) and one per distinct timeseries interval,
+ * so a total is never replaced by its last time bucket and each timeseries keeps its own interval.
+ */
+export function aggregatePasses(
+  req: AggregateRequest,
+  auto: (from: number, to: number) => number,
+): { interval: number | null; computes: AggregateRequest["computes"] }[] {
+  const passes: { interval: number | null; computes: AggregateRequest["computes"] }[] = [];
+  const totals = req.computes.filter((c) => !c.timeseries);
+  if (totals.length) passes.push({ interval: null, computes: totals });
+  const byInterval = new Map<number, AggregateRequest["computes"]>();
+  for (const c of req.computes.filter((x) => x.timeseries)) {
+    const iv = c.interval ?? auto(req.from, req.to);
+    byInterval.set(iv, [...(byInterval.get(iv) ?? []), c]);
+  }
+  for (const [interval, computes] of byInterval) passes.push({ interval, computes });
+  return passes;
+}
+
+/** Merges the buckets of several passes (same group-by) into one bucket per group. */
+export function mergeBuckets(parts: { by: Record<string, string>; computes: Record<string, unknown> }[][]) {
+  const m = new Map<string, { by: Record<string, string>; computes: Record<string, unknown> }>();
+  for (const part of parts)
+    for (const b of part) {
+      const k = JSON.stringify(b.by);
+      const cur = m.get(k);
+      if (cur) Object.assign(cur.computes, b.computes);
+      else m.set(k, { by: b.by, computes: { ...b.computes } });
+    }
+  return [...m.values()];
+}
+
 /** Shape aggregate rows into response buckets: one bucket per group, with total or timeseries computes. */
 export function toBuckets(req: AggregateRequest, rows: any[]): { by: Record<string, string>; computes: Record<string, unknown> }[] {
   const ts = req.computes.some((c) => c.timeseries);

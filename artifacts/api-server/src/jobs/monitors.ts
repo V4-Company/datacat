@@ -74,12 +74,22 @@ export function parseMonitorQuery(type: string, query: string): Parsed {
   for (const raw of Object.values(queries)) parseMetricQuery(raw);
   return {
     kind: "metric",
-    timeAgg: m[1].startsWith("percentile") ? "p95" : m[1].replace(/\(.*$/, ""),
+    timeAgg: monitorTimeAgg(m[1]),
     window: windowSecs(m[2]),
     expr,
     op: cmp[1],
     threshold: Number(cmp[2]),
   };
+}
+
+/** avg|sum|min|max|last as is; percentile(95) or percentile(p95) -> "p95"; change(...) / pct_change(...) by name. */
+function monitorTimeAgg(f: string): string {
+  if (f.startsWith("percentile")) {
+    const pm = /^percentile\(\s*p?(\d{1,2}(?:\.\d+)?)\s*\)$/.exec(f);
+    if (!pm || !(Number(pm[1]) > 0 && Number(pm[1]) < 100)) throw new Error("percentile() takes a number between 0 and 100, e.g. percentile(95)");
+    return `p${pm[1]}`;
+  }
+  return f.replace(/\(.*$/, "");
 }
 
 export function validateMonitorQuery(type: string, query: string) {
@@ -116,14 +126,26 @@ function stateFor(v: number | null, op: string, opts: any, threshold: number, pr
 // For log and trace monitors, an empty window is a count of 0, or missing data when the monitor has notify_no_data set
 // (the same on both storage backends). Grouped monitors report each group that matched; groups that stop matching are
 // handled by the caller as disappeared groups.
-async function evaluateValues(orgId: number, p: Parsed, noData = false): Promise<Map<string, { value: number | null; tags: string[] }>> {
-  const now = Math.floor(Date.now() / 1000);
-  const out = new Map<string, { value: number | null; tags: string[] }>();
+type GroupValue = { value: number | null; tags: string[]; lastMs?: number };
+// Group-by fields that are real columns of each data set; anything else is an attribute (logs) or a meta key (spans).
+const LOG_GROUP_COLS = ["service", "host", "status", "source"];
+const SPAN_GROUP_COLS = ["service", "host", "env", "resource", "name", "type"];
+
+async function evaluateValues(orgId: number, p: Parsed, noData = false, delaySec = 0): Promise<Map<string, GroupValue>> {
+  // evaluation_delay moves the whole window back, so late telemetry is complete before it is judged
+  const now = Math.floor(Date.now() / 1000) - delaySec;
+  const out = new Map<string, GroupValue>();
   if (p.kind === "metric") {
     const set = await evalMetricExpression(orgId, p.expr, now - p.window, now);
     for (const s of set) {
-      const vals = [...s.points.values()];
-      out.set(s.key, { value: vals.length ? reduce(vals, p.timeAgg) : null, tags: s.tags });
+      const pts = [...s.points].sort((a, b) => a[0] - b[0]);
+      const vals = pts.map((x) => x[1]);
+      const lastTs = pts.at(-1)?.[0];
+      out.set(s.key, {
+        value: vals.length ? reduce(vals, p.timeAgg) : null,
+        tags: s.tags,
+        lastMs: lastTs === undefined ? undefined : Math.min(now, lastTs + (s.interval ?? 0)) * 1000,
+      });
     }
     if (!set.length) out.set("*", { value: null, tags: [] });
     return out;
@@ -132,24 +154,21 @@ async function evaluateValues(orgId: number, p: Parsed, noData = false): Promise
   if (useClickHouse) {
     const { where, b } = isLog ? logWhereCh(orgId, p.logQuery ?? "*", now - p.window, now) : spanWhereCh(orgId, p.logQuery ?? "*", now - p.window, now);
     const g = p.groupBy ?? [];
-    const cols = g.map((k) =>
-      ["service", "host", "status", "source", "env"].includes(k)
-        ? k === "status" && !isLog
-          ? "if(error = 1, 'error', 'ok')"
-          : k
-        : isLog
-          ? `attrs[${b.p(k.replace(/^@/, ""))}]`
-          : `meta[${b.p(k.replace(/^@/, ""))}]`,
-    );
+    const cols = g.map((k) => {
+      if (k === "status" && !isLog) return "if(error = 1, 'error', 'ok')";
+      if ((isLog ? LOG_GROUP_COLS : SPAN_GROUP_COLS).includes(k)) return k;
+      if (isLog && k === "env") return "substring(arrayFirst(t -> startsWith(t, 'env:'), tags), 5)";
+      return isLog ? `attrs[${b.p(k.replace(/^@/, ""))}]` : `meta[${b.p(k.replace(/^@/, ""))}]`;
+    });
     const sel = cols.length ? cols.map((c, i) => `${c} AS g${i}`).join(", ") + "," : "";
     const rows = await chQuery(
-      `SELECT ${sel} count() AS c FROM ${isLog ? "logs" : "spans"} WHERE ${where} ${cols.length ? `GROUP BY ${cols.map((_, i) => `g${i}`).join(", ")}` : ""}`,
+      `SELECT ${sel} count() AS c, max(${isLog ? "ts" : "start_ms"}) AS last FROM ${isLog ? "logs" : "spans"} WHERE ${where} ${cols.length ? `GROUP BY ${cols.map((_, i) => `g${i}`).join(", ")}` : ""}`,
       b.params,
     );
     for (const r of rows as any[]) {
       if (!g.length && !Number(r.c)) continue;
       const tags = g.map((k, i) => `${k.replace(/^@/, "")}:${r[`g${i}`] || "N/A"}`);
-      out.set(tags.length ? tags.join(",") : "*", { value: Number(r.c), tags });
+      out.set(tags.length ? tags.join(",") : "*", { value: Number(r.c), tags, lastMs: Number(r.last) || undefined });
     }
     if (!out.size) out.set("*", { value: noData ? null : 0, tags: [] });
     return out;
@@ -164,22 +183,28 @@ async function evaluateValues(orgId: number, p: Parsed, noData = false): Promise
   const g = p.groupBy ?? [];
   const cols = g.map((k) => {
     if (k === "status" && !isLog) return "case when error = 1 then 'error' else 'ok' end";
-    if (["service", "host", "status", "source", "env"].includes(k)) return k;
+    if ((isLog ? LOG_GROUP_COLS : SPAN_GROUP_COLS).includes(k)) return k;
+    if (isLog && k === "env") return "(select substr(t, 5) from unnest(tags) t where t like 'env:%' limit 1)";
     const key = k.replace(/^@/, "");
-    params.push(isLog ? key.split(".") : key);
-    return isLog ? `attributes #>> $${params.length}::text[]` : `meta ->> $${params.length}::text`;
+    if (!isLog) {
+      params.push(key);
+      return `meta ->> $${params.length}::text`;
+    }
+    // nested path or a flat dotted key, the same lookup as search
+    params.push(key.split("."), key);
+    return `COALESCE(attributes #>> $${params.length - 1}::text[], attributes ->> $${params.length}::text)`;
   });
   const sel = cols.length ? cols.map((c, i) => `${c} as g${i}`).join(", ") + "," : "";
   const rows = (
     await pool.query(
-      `select ${sel} count(*)::int as c from ${isLog ? "logs" : "spans"} where ${where} ${cols.length ? `group by ${cols.map((_, i) => i + 1).join(",")}` : ""}`,
+      `select ${sel} count(*)::int as c, max(${isLog ? "ts" : "start_ms"}) as last from ${isLog ? "logs" : "spans"} where ${where} ${cols.length ? `group by ${cols.map((_, i) => i + 1).join(",")}` : ""}`,
       params,
     )
   ).rows;
   for (const r of rows) {
     if (!g.length && !Number(r.c)) continue;
     const tags = g.map((k, i) => `${k.replace(/^@/, "")}:${r[`g${i}`] ?? "N/A"}`);
-    out.set(tags.length ? tags.join(",") : "*", { value: Number(r.c), tags });
+    out.set(tags.length ? tags.join(",") : "*", { value: Number(r.c), tags, lastMs: Number(r.last) || undefined });
   }
   if (!out.size) out.set("*", { value: noData ? null : 0, tags: [] });
   return out;
@@ -362,7 +387,8 @@ async function evaluateMonitorNow(id: number) {
     logger.warn({ id, err: String(e) }, "invalid monitor");
     return;
   }
-  const values = await evaluateValues(mon.org_id, parsed, !!mon.options?.notify_no_data);
+  const delaySec = Math.min(86_400, Math.max(0, Number(mon.options?.evaluation_delay) || 0));
+  const values = await evaluateValues(mon.org_id, parsed, !!mon.options?.notify_no_data, delaySec);
   const prevStates: Record<string, { state: State; value: number | null; tags: string[]; since: number }> = mon.group_states ?? {};
   const next: typeof prevStates = {};
   const now = Date.now();
@@ -383,15 +409,21 @@ async function evaluateMonitorNow(id: number) {
         ? "No Data"
         : (prev ?? "OK");
     next[key] = { state: st, value: v.value, tags: v.tags, since: prev === st ? prevStates[key].since : now };
-    (next[key] as any).seen = hasValue ? now : (prevStates[key] as any)?.seen;
+    // the no-data timer runs from the newest data point, not from this evaluation
+    (next[key] as any).seen = hasValue ? (v.lastMs ?? now) : (prevStates[key] as any)?.seen;
     if ((prev ?? "OK") !== st && !(prev === undefined && st === "OK")) transitions.push({ key, from: prev ?? "OK", to: st, value: v.value, tags: v.tags });
   }
-  // groups that disappeared
+  // Groups that disappeared from the result. With notify_no_data every group is kept until the no-data check resolves
+  // it (OK groups included, so a host that stops reporting does alert); without it, an alerting group recovers.
   for (const [key, ps] of Object.entries(prevStates)) {
-    if (!next[key] && ps.state !== "OK" && now - ps.since < 3600_000) {
-      const st: State = mon.options?.notify_no_data ? (missingLongEnough(key) ? "No Data" : ps.state) : "OK";
+    if (next[key]) continue;
+    if (mon.options?.notify_no_data) {
+      const st: State = missingLongEnough(key) ? "No Data" : ps.state;
       next[key] = { ...ps, state: st, value: null, since: ps.state === st ? ps.since : now };
       if (ps.state !== st) transitions.push({ key, from: ps.state, to: st, value: null, tags: ps.tags });
+    } else if (ps.state !== "OK" && now - ps.since < 3600_000) {
+      next[key] = { ...ps, state: "OK", value: null, since: now };
+      transitions.push({ key, from: ps.state, to: "OK", value: null, tags: ps.tags });
     }
   }
   const overall = Object.values(next).reduce<State>((w, s) => (RANK[s.state] > RANK[w] ? s.state : w), "OK") as State;
@@ -407,8 +439,15 @@ async function evaluateMonitorNow(id: number) {
       } else (s as any).notified = lastN;
     }
   }
+  for (const t of transitions) if (t.to === "Alert" || t.to === "Warn") lastTriggered = now;
+  // Compare-and-set: when two processes evaluate the same monitor at once, only the one whose state write lands sends
+  // the events and notifications, so a transition is announced once.
+  const saved = await pool.query(
+    "update monitors set overall_state=$2, group_states=$3, last_evaluated_at=$4, last_triggered_at=$5 where id=$1 and last_evaluated_at is not distinct from $6::bigint returning id",
+    [id, overall, next, now, lastTriggered, mon.last_evaluated_at ?? null],
+  );
+  if (!saved.rowCount) return;
   for (const t of transitions) {
-    if (t.to === "Alert" || t.to === "Warn") lastTriggered = now;
     const label = t.to === "OK" ? "Recovered" : t.to === "No Data" ? "No Data" : t.to === "Warn" ? "Warn" : "Triggered";
     const ctx = {
       state: t.to,
@@ -458,13 +497,6 @@ async function evaluateMonitorNow(id: number) {
       );
     }
   }
-  await pool.query("update monitors set overall_state=$2, group_states=$3, last_evaluated_at=$4, last_triggered_at=$5 where id=$1", [
-    id,
-    overall,
-    next,
-    now,
-    lastTriggered,
-  ]);
 }
 
 // Each organization's monitors run in their own chain, so a slow notification destination in one organization never

@@ -26,7 +26,6 @@ function valueOf(idx: number): number {
   return MIN_NS * Math.pow(GAMMA, idx) * (2 / (1 + GAMMA));
 }
 
-const BOOT_MS = Date.now();
 let ready: Promise<void> | null = null;
 export function ensureSpanStats(): Promise<void> {
   if (useClickHouse) return ch.ensureSpanStats();
@@ -44,8 +43,12 @@ export function ensureSpanStats(): Promise<void> {
       pool
         .query("create index concurrently if not exists spans_errors on spans (org_id, service, start_ms) where error = 1")
         .catch((e) => logger.warn({ err: e }, "spans_errors index creation failed"));
-      // First run on an existing install: build rollups for spans stored before this version (in the background).
-      if (!existed) backfillSpanStats().catch((e) => logger.warn({ err: e }, "span_stats backfill failed"));
+      // First run on an existing install: build rollups for spans stored before this point (in the background). The
+      // limit is the highest span id now, so spans inserted later (whatever their start time) are counted once, by intake.
+      if (!existed) {
+        const maxId = Number((await pool.query("select coalesce(max(id), 0) as m from spans")).rows[0].m);
+        backfillSpanStats(maxId).catch((e) => logger.warn({ err: e }, "span_stats backfill failed"));
+      }
     })().catch((e) => {
       ready = null;
       throw e;
@@ -132,10 +135,6 @@ export async function recordSpanStats(orgId: number, spans: SpanLike[]) {
     process.once("beforeExit", () => {
       void flushSpanStats();
     });
-    for (const sig of ["SIGTERM", "SIGINT"] as const)
-      process.once(sig, () => {
-        flushSpanStats().finally(() => process.exit(0));
-      });
   }
 }
 
@@ -351,7 +350,7 @@ export async function serviceOperations(orgId: number, service: string, from: nu
 }
 
 /** One-time backfill of rollups from raw spans stored before the table existed (spans written since boot are recorded by intake). */
-async function backfillSpanStats() {
+async function backfillSpanStats(maxId: number) {
   const t0 = Date.now();
   await pool.query(
     `insert into span_stats (org_id, bucket, service, env, name, resource, type, lang, hits, errors, dur_sum, dur_max, hist_idx, hist_cnt)
@@ -359,7 +358,7 @@ async function backfillSpanStats() {
      from (select org_id, (start_ms / 60000) * 60 as bucket, service, env, name, resource, max(type) as type, max(meta->>'language') as lang,
                   case when duration <= ${MIN_NS} then 0 else ceil(ln(duration::float8 / ${MIN_NS}) / ln(${GAMMA}))::int end as idx,
                   count(*)::int as c, sum(error)::int as e, sum(duration)::float8 as s, max(duration)::float8 as m
-           from spans where is_top_level=1 and start_ms < ${BOOT_MS} group by 1,2,3,4,5,6,9) x
+           from spans where is_top_level=1 and id <= ${Math.floor(maxId)} group by 1,2,3,4,5,6,9) x
      group by org_id, bucket, service, env, name, resource`,
   );
   logger.info({ ms: Date.now() - t0 }, "span_stats backfilled from spans");
