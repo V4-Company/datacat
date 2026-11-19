@@ -56,7 +56,9 @@ DataCat accepts the Datadog public intake API and OTLP/HTTP:
 `GET /api/v1/intake/stats` shows, per intake path, how many items were stored and how many were dropped since the
 server started.
 
-Sign-in uses local email/password accounts; members join through single-use invite links.
+Sign-in uses local email/password accounts; members join through single-use invite links. Optionally, members can
+sign in with Google or another OpenID Connect provider, restricted to your email domains (see
+[self-hosting](docs/SELF_HOSTING.md#single-sign-on-oidc--google)).
 
 ## From source
 

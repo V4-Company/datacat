@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useSearch } from "wouter";
-import { Search, Plus, Trash2, Copy, Eye, EyeOff, LayoutDashboard, Server, Bell, ScrollText, Activity, LineChart } from "lucide-react";
+import { Search, Plus, Trash2, Copy, Eye, EyeOff, LayoutDashboard, Server, Bell, ScrollText, Activity, LineChart, LogIn } from "lucide-react";
 import { api } from "@/lib/api";
 import { PageHeader, ICONS } from "@/components/Layout";
 import { TimePicker } from "@/components/TimePicker";
@@ -636,6 +636,27 @@ export function Home() {
   );
 }
 
+/** Why single sign-on sent the browser back to /login?error=<code>. */
+function oidcErrorMessage(code: string | null, label: string): string | null {
+  if (!code?.startsWith("oidc_")) return null;
+  switch (code) {
+    case "oidc_domain_not_allowed":
+      return "That account can't sign in to DataCat. Use your organization's account.";
+    case "oidc_email_unverified":
+      return `Your email address isn't verified with ${label}. Verify it, then try again.`;
+    case "oidc_state_mismatch":
+      return "Your sign-in expired or was started in another tab. Try again.";
+    case "oidc_setup_required":
+      return "DataCat isn't set up yet. An administrator must first create the admin account with the setup token.";
+    case "oidc_cancelled":
+      return "Sign-in was cancelled.";
+    case "oidc_misconfigured":
+      return "Single sign-on is not configured correctly. Ask your DataCat administrator to check the server log.";
+    default:
+      return `Couldn't sign in with ${label}. Try again.`;
+  }
+}
+
 export function Login({ restricted, email }: { restricted?: boolean; email?: string | null }) {
   const { logout, data } = useAuthUser();
   const [address, setAddress] = useState("");
@@ -650,6 +671,11 @@ export function Login({ restricted, email }: { restricted?: boolean; email?: str
     retry: false,
   });
   const setup = !!data?.setupRequired && !token;
+  const oidcLabel = data?.oidc?.label || "single sign-on";
+  const oidcError = oidcErrorMessage(new URLSearchParams(window.location.search).get("error"), oidcLabel);
+  const showOidc = !!data?.oidc?.enabled && !setup && !token;
+  // After signing in, come back to the page that asked for it (the login page itself goes home).
+  const here = window.location.pathname === "/login" ? "/" : window.location.pathname + window.location.search + window.location.hash;
   const submit = useMutation({
     mutationFn: () =>
       api(token ? `/auth/invites/${encodeURIComponent(token)}` : setup ? "/auth/setup" : "/auth/login", {
@@ -669,6 +695,11 @@ export function Login({ restricted, email }: { restricted?: boolean; email?: str
         <p className="text-ink-2 mb-6">Metrics, logs, traces, dashboards and alerts in one place.</p>
         {setup && <h2 className="font-semibold text-base mb-4">Create your admin account + organization</h2>}
         {token && <h2 className="font-semibold text-base mb-4">Join your organization</h2>}
+        {oidcError && !restricted && (
+          <p role="alert" className="text-alert mb-4 text-sm" data-testid="oidc-error">
+            {oidcError}
+          </p>
+        )}
         {invite.isError && (
           <p role="alert" className="text-alert mb-4 text-sm">
             {invite.error.message}
@@ -685,6 +716,23 @@ export function Login({ restricted, email }: { restricted?: boolean; email?: str
           </>
         ) : (
           <>
+            {showOidc && (
+              <>
+                <a
+                  className="btn-primary w-full justify-center h-10"
+                  href={`/api/auth/oidc/start?returnTo=${encodeURIComponent(here)}`}
+                  data-testid="login-oidc"
+                >
+                  <LogIn size={16} />
+                  Continue with {oidcLabel}
+                </a>
+                <div className="flex items-center gap-3 my-4 text-[11px] text-ink-3">
+                  <span className="flex-1 border-t border-line" />
+                  or sign in with email
+                  <span className="flex-1 border-t border-line" />
+                </div>
+              </>
+            )}
             {(!token || invite.data) && (
               <form
                 className="text-left space-y-3"
@@ -753,7 +801,7 @@ export function Login({ restricted, email }: { restricted?: boolean; email?: str
                     {submit.error.message}
                   </p>
                 )}
-                <button className="btn-primary w-full justify-center h-10" disabled={submit.isPending} data-testid="login">
+                <button className={`${showOidc ? "btn" : "btn-primary"} w-full justify-center h-10`} disabled={submit.isPending} data-testid="login">
                   {submit.isPending ? "Please wait…" : setup ? "Create admin account" : token ? "Set password and join" : "Log in"}
                 </button>
               </form>

@@ -21,6 +21,7 @@ export function useAuthUser() {
         email: string | null;
         setupRequired: boolean;
         setupTokenRequired?: boolean;
+        oidc?: { enabled: boolean; label: string };
       }>("/auth/user"),
     staleTime: 60_000,
   });
