@@ -3,6 +3,7 @@ import cors from "cors";
 import cookieParser from "cookie-parser";
 import pinoHttp from "pino-http";
 import router from "./routes";
+import { mcpParseErrors } from "./routes/mcp";
 import intakeRouter from "./intake/routes";
 import downloadsRouter from "./routes/downloads";
 import tracerRouter from "./intake/tracer";
@@ -71,6 +72,7 @@ if (fs.existsSync(path.join(uiDir, "index.html"))) {
     res.sendFile(path.join(uiDir, "index.html"));
   });
 }
+app.use("/api/mcp", mcpParseErrors);
 app.use((err: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
   logger.error({ err }, "Request failed");
   res.status(500).json({ error: "An internal error occurred. Check the server logs." });
