@@ -12,6 +12,7 @@ No hosted account or external service is required.
 - APM service catalog, trace explorer and waterfall
 - Metric, log and trace monitors with webhook/Slack notifications
 - Organizations, local accounts, single-use invites, API/application keys
+- Read-only MCP server (`/api/mcp`) so AI assistants like Claude Code can query metrics, logs, traces and monitors
 - OpenTelemetry Collector-based host agent and Node.js/Python instrumentation libraries
 - One production process serving the API, web UI, installer and downloads
 

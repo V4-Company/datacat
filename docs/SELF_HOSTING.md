@@ -273,6 +273,27 @@ observe.example.com {
 }
 ```
 
+### MCP server for AI assistants
+
+DataCat serves a read-only [Model Context Protocol](https://modelcontextprotocol.io) endpoint at
+`<PUBLIC_URL>/api/mcp` (Streamable HTTP transport, stateless, JSON responses), so assistants such as
+Claude Code can query your telemetry. It accepts only an API key + application key pair: an admin
+creates both under **Organization Settings → API Keys**. Cookie sessions are refused, and requests
+with an `Origin` header other than `PUBLIC_URL` are rejected. To add it to Claude Code:
+
+```sh
+claude mcp add --transport http datacat https://observe.example.com/api/mcp \
+  --header "DD-API-KEY: <api key>" --header "DD-APPLICATION-KEY: <application key>"
+```
+
+Tools: `list_services`, `get_service`, `search_spans`, `get_trace`, `query_metrics`, `search_metrics`,
+`get_metric_tags`, `search_logs`, `aggregate_logs`, `list_monitors`, `list_dashboards` and `get_dashboard`.
+They only read: each one calls DataCat's own HTTP API with the caller's keys, so it sees exactly what
+those keys can see. Results are compact and capped (at most 200 logs or spans per call, about 40 KB of
+text). Time ranges accept `now-15m`, `now-1h`, `now-7d`, ISO 8601 or epoch milliseconds; queries use
+Datadog syntax. Telemetry can contain personal data, and whatever a tool returns is sent to the
+assistant's model provider; use a dedicated application key and revoke it when no longer needed.
+
 ## 4. Release assets and host agent
 
 Download the matching release assets and `SHA256SUMS` from your project's GitHub
