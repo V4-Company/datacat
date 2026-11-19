@@ -6,6 +6,8 @@ import express, { type NextFunction, type Request, type Response } from "express
 import { mcpRouter, mcpParseErrors } from "../src/routes/mcp";
 import { handleMcpMessage, negotiateVersion } from "../src/lib/mcp";
 import { TOOLS, capOutput, checkArgs, downsample, loopbackApi, loopbackBase, traceTree, MAX_OUTPUT_CHARS, type FetchLike } from "../src/lib/mcpTools";
+import { MCP_INTERNAL_HEADERS, internalCredentialHeaders, isReadOnlyRequest } from "../src/lib/mcpInternal";
+import { newMcpToken, type McpTokenStore } from "../src/lib/mcpTokens";
 
 // The real authMiddleware needs the database; this one sets the same request fields from fixed test credentials.
 function fakeAuth(req: Request, _res: Response, next: NextFunction) {
@@ -33,12 +35,38 @@ const stubFetch: FetchLike = async (url, init) => {
   return new Response(JSON.stringify(out.json), { status: out.status ?? 200, headers: { "content-type": "application/json" } });
 };
 
+/** Personal MCP tokens: org 2's member u2 owns GOOD; REVOKED is revoked; MOVED's creator now belongs to org 3; GONE's creator was deleted. */
+const GOOD = newMcpToken();
+const REVOKED = newMcpToken();
+const MOVED = newMcpToken();
+const GONE = newMcpToken();
+const tokenRows = new Map([
+  [GOOD, { id: 1, orgId: 2, userId: "u2", revoked: false }],
+  [REVOKED, { id: 2, orgId: 2, userId: "u2", revoked: true }],
+  [MOVED, { id: 3, orgId: 2, userId: "u3", revoked: false }],
+  [GONE, { id: 4, orgId: 2, userId: "deleted", revoked: false }],
+]);
+const memberships = new Map([
+  ["u2", 2],
+  ["u3", 3],
+]);
+const tokens: McpTokenStore = {
+  list: async () => [],
+  create: async () => {
+    throw new Error("not used");
+  },
+  revoke: async () => false,
+  find: async (token) => tokenRows.get(token) ?? null,
+  userOrg: async (userId) => memberships.get(userId) ?? null,
+  touch: async () => undefined,
+};
+
 let server: Server;
 let base = "";
 before(async () => {
   const app = express();
   app.use(express.json());
-  app.use("/api", fakeAuth, mcpRouter({ base: "http://datacat.test", fetch: stubFetch }));
+  app.use("/api", fakeAuth, mcpRouter({ base: "http://datacat.test", fetch: stubFetch, tokens }));
   app.use("/api/mcp", mcpParseErrors);
   server = app.listen(0, "127.0.0.1");
   await new Promise<void>((r) => server.once("listening", r));
@@ -151,6 +179,28 @@ test("auth: keys required; no credentials 401, wrong keys 403, cookie session al
   assert.equal((await rpc("tools/list", undefined, {})).status, 401);
 });
 
+test("auth: personal MCP token as Authorization: Bearer; revoked, unknown and moved or removed members' tokens are 403", async () => {
+  const bearer = (t: string) => ({ authorization: `Bearer ${t}` });
+  routes = { "GET /api/v1/monitor": () => ({ json: [] }) };
+  calls.length = 0;
+  const ok = await rpc("tools/call", { name: "list_monitors", arguments: {} }, bearer(GOOD));
+  assert.equal(ok.status, 200, ok.text);
+  assert.equal(ok.json.result.isError, false);
+  assert.equal(calls[0].headers.get(MCP_INTERNAL_HEADERS.org), "2", "tools run in the token's organization");
+  assert.equal(calls[0].headers.get("authorization"), null, "the token is not forwarded");
+  for (const t of [REVOKED, MOVED, GONE, newMcpToken(), "not-a-token", ""]) {
+    const r = await rpc("ping", undefined, bearer(t));
+    assert.equal(r.status, 403, t);
+    assert.equal(r.json.error.code, -32600);
+    assert.match(r.json.error.message, /invalid or revoked MCP token/);
+  }
+  assert.equal((await rpc("ping", undefined, { ...bearer(GOOD), "x-test-session": "1" })).status, 200, "the token decides, not the cookie");
+  assert.equal((await rpc("ping", undefined, { authorization: "Basic dXNlcjpwYXNz" })).status, 401);
+  const evil = await rpc("ping", undefined, { ...bearer(GOOD), origin: "https://evil.example" });
+  assert.equal(evil.status, 403);
+  assert.match(evil.json.error.message, /origin/);
+});
+
 test("Origin: another site is refused; DataCat's own origin and no origin are accepted", async () => {
   const evil = await rpc("ping", undefined, { ...KEYS, origin: "https://evil.example" });
   assert.equal(evil.status, 403);
@@ -203,7 +253,7 @@ test("time arguments: date math, ISO 8601 and epoch milliseconds reach the API a
   assert.equal(bodies[3].query, "*");
 });
 
-test("query_metrics: calls the metrics API with the caller's keys and summarizes each series", async () => {
+test("query_metrics: calls the metrics API with the internal read-only credential and summarizes each series", async () => {
   const points = Array.from({ length: 120 }, (_, i) => [1767225600000 + i * 60000, i + 1]);
   routes = {
     "POST /api/ui/metrics/query": () => ({
@@ -222,8 +272,10 @@ test("query_metrics: calls the metrics API with the caller's keys and summarizes
   assert.equal(r.isError, false);
   assert.equal(calls.length, 1);
   assert.equal(calls[0].method, "POST");
-  assert.equal(calls[0].headers.get("dd-api-key"), "api-good");
-  assert.equal(calls[0].headers.get("dd-application-key"), "app-good");
+  assert.equal(calls[0].headers.get("dd-api-key"), null, "the caller's keys are not forwarded");
+  assert.equal(calls[0].headers.get("dd-application-key"), null);
+  assert.equal(calls[0].headers.get(MCP_INTERNAL_HEADERS.secret), internalCredentialHeaders(1)[MCP_INTERNAL_HEADERS.secret]);
+  assert.equal(calls[0].headers.get(MCP_INTERNAL_HEADERS.org), "1");
   assert.equal(calls[0].headers.get("cookie"), null);
   assert.deepEqual((calls[0].body as { queries: unknown }).queries, [{ name: "a", query: q }]);
   const out = JSON.parse(r.content[0].text);
@@ -249,7 +301,7 @@ test("API errors and timeouts are tool errors with the API's message", async () 
   assert.equal(r.isError, true);
   assert.match(r.content[0].text, /404: Dashboard not found/);
   const hang: FetchLike = (_url, init) => new Promise((_, reject) => init?.signal?.addEventListener("abort", () => reject(init.signal?.reason)));
-  const api = loopbackApi({ base: "http://datacat.test", apiKey: "a", appKey: "b", fetch: hang, timeoutMs: 20 });
+  const api = loopbackApi({ base: "http://datacat.test", orgId: 1, fetch: hang, timeoutMs: 20 });
   const t = await handleMcpMessage({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "list_monitors", arguments: {} } }, api);
   const result = (t.body as { result: { isError: boolean; content: { text: string }[] } }).result;
   assert.equal(result.isError, true);
@@ -306,4 +358,21 @@ test("get_trace prints spans as a tree by parent_id", () => {
 test("the loopback base is this process's PORT on 127.0.0.1", () => {
   assert.equal(loopbackBase({}), "http://127.0.0.1:3000");
   assert.equal(loopbackBase({ PORT: "8080" }), "http://127.0.0.1:8080");
+});
+
+test("every POST the tools make is one the internal credential accepts as read-only", async () => {
+  routes = {
+    "POST /api/ui/apm/spans": () => ({ json: { spans: [], total: 0 } }),
+    "POST /api/ui/metrics/query": () => ({ json: { series: [] } }),
+    "POST /api/ui/logs/search": () => ({ json: { logs: [], total: 0 } }),
+    "POST /api/v2/logs/analytics/aggregate": () => ({ json: { data: { buckets: [] } } }),
+  };
+  calls.length = 0;
+  await callTool("search_spans", {});
+  await callTool("query_metrics", { query: "avg:system.cpu.user{*}" });
+  await callTool("search_logs", {});
+  await callTool("aggregate_logs", {});
+  const posts = calls.filter((c) => c.method === "POST").map((c) => c.path.replace(/^\/api/, ""));
+  assert.equal(new Set(posts).size, 4);
+  for (const p of posts) assert.ok(isReadOnlyRequest("POST", p), p);
 });

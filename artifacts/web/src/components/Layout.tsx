@@ -17,6 +17,7 @@ import {
   UserPlus,
   LifeBuoy,
   PlugZap,
+  Bot,
 } from "lucide-react";
 import { CatMark } from "./Logo";
 import { useAuthUser } from "@/lib/auth";
@@ -229,6 +230,12 @@ export function Layout({ children }: { children: ReactNode }) {
             className={`flex items-center gap-2.5 mx-2 px-2.5 h-[30px] rounded-[3px] text-[13px] ${loc.startsWith("/account/agent") ? "bg-white/[0.13] font-semibold" : "text-white/75 hover:bg-white/[0.08]"}`}
           >
             <PlugZap size={15} /> Install Agent
+          </Link>
+          <Link
+            href="/account/mcp"
+            className={`flex items-center gap-2.5 mx-2 px-2.5 h-[30px] rounded-[3px] text-[13px] ${loc.startsWith("/account/mcp") ? "bg-white/[0.13] font-semibold" : "text-white/75 hover:bg-white/[0.08]"}`}
+          >
+            <Bot size={15} /> MCP server
           </Link>
           <Link
             href="/docs"

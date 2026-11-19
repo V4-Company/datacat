@@ -277,9 +277,25 @@ observe.example.com {
 
 DataCat serves a read-only [Model Context Protocol](https://modelcontextprotocol.io) endpoint at
 `<PUBLIC_URL>/api/mcp` (Streamable HTTP transport, stateless, JSON responses), so assistants such as
-Claude Code can query your telemetry. It accepts only an API key + application key pair: an admin
-creates both under **Organization Settings → API Keys**. Cookie sessions are refused, and requests
-with an `Origin` header other than `PUBLIC_URL` are rejected. To add it to Claude Code:
+Claude Code can query your telemetry. Cookie sessions are refused, and requests with an `Origin`
+header other than `PUBLIC_URL` are rejected.
+
+**Personal MCP tokens (any signed-in user).** Open `/account/mcp` in DataCat, create a token and copy
+it: it is shown only once. Each user can have up to 10 active tokens and revoke them on the same
+page. Then add DataCat to Claude Code:
+
+```sh
+claude mcp add --transport http datacat https://observe.example.com/api/mcp \
+  --header "Authorization: Bearer <token>"
+```
+
+A token acts for its creator's organization and stops working when it is revoked, or when its
+creator's account is deleted or leaves the organization. Admins see every member's MCP tokens (name,
+owner and last use, never the value) in the organization's key list returned by `GET /api/ui/org`,
+and can revoke any of them with `DELETE /api/ui/org/keys/<id>`.
+
+**API key + application key.** Scripts and shared setups can still use a key pair, which an admin
+creates under **Organization Settings → API Keys**:
 
 ```sh
 claude mcp add --transport http datacat https://observe.example.com/api/mcp \
@@ -288,11 +304,14 @@ claude mcp add --transport http datacat https://observe.example.com/api/mcp \
 
 Tools: `list_services`, `get_service`, `search_spans`, `get_trace`, `query_metrics`, `search_metrics`,
 `get_metric_tags`, `search_logs`, `aggregate_logs`, `list_monitors`, `list_dashboards` and `get_dashboard`.
-They only read: each one calls DataCat's own HTTP API with the caller's keys, so it sees exactly what
-those keys can see. Results are compact and capped (at most 200 logs or spans per call, about 40 KB of
-text). Time ranges accept `now-15m`, `now-1h`, `now-7d`, ISO 8601 or epoch milliseconds; queries use
-Datadog syntax. Telemetry can contain personal data, and whatever a tool returns is sent to the
-assistant's model provider; use a dedicated application key and revoke it when no longer needed.
+They only read, with either credential: each tool calls DataCat's own HTTP API over loopback with an
+internal credential (a random secret made at startup and held in memory) for the caller's
+organization, and the API accepts that credential for reads only. An admin's key pair therefore gets
+no write access through MCP. Results are compact and capped (at most 200 logs or spans per call, about
+40 KB of text). Time ranges accept `now-15m`, `now-1h`, `now-7d`, ISO 8601 or epoch milliseconds;
+queries use Datadog syntax. Telemetry can contain personal data, and whatever a tool returns is sent to
+the assistant's model provider; use a dedicated token or application key and revoke it when no longer
+needed.
 
 ## 4. Release assets and host agent
 
