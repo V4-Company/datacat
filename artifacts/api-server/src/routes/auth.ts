@@ -1,8 +1,22 @@
-import { db, usersTable, invitesTable, orgsTable } from "@workspace/db";
+import { db, usersTable, invitesTable, orgsTable, type User } from "@workspace/db";
 import { Router, type IRouter, type Request, type Response } from "express";
-import { eq, sql } from "drizzle-orm";
+import { asc, eq, sql } from "drizzle-orm";
 import { clearSession, createSession, getSessionId, setSessionCookie, hashPassword, verifyPassword, type SessionData } from "../lib/auth";
-import { getOrigin } from "../lib/config";
+import { getOrigin, oidcConfig, secureCookies } from "../lib/config";
+import { logger } from "../lib/logger";
+import {
+  OidcError,
+  OidcProvider,
+  STATE_TTL_MS,
+  authorizeClaims,
+  newLoginState,
+  openState,
+  sameString,
+  sealState,
+  stateKey,
+  type OidcConfig,
+  type OidcProfile,
+} from "../lib/oidc";
 import crypto from "node:crypto";
 
 // First-run setup creates the first admin and always needs the setup token: DATACAT_SETUP_TOKEN if set, otherwise a
@@ -39,15 +53,21 @@ export function validEmail(email: string): boolean {
   return email.slice(at + 2, -1).includes(".");
 }
 
-router.get("/auth/user", async (req: Request, res: Response) => {
+async function hasUsers(): Promise<boolean> {
   const [existing] = await db.select({ id: usersTable.id }).from(usersTable).limit(1);
+  return !!existing;
+}
+
+router.get("/auth/user", async (req: Request, res: Response) => {
+  const setupDone = await hasUsers();
   res.json({
     user: req.authUser ?? null,
     signedIn: !!req.sessionUser,
     restricted: !!req.sessionUser && !req.authUser,
     email: req.sessionUser?.email ?? null,
-    setupRequired: !existing,
-    setupTokenRequired: !existing,
+    setupRequired: !setupDone,
+    setupTokenRequired: !setupDone,
+    oidc: { enabled: !!oidcConfig, label: oidcConfig?.label ?? "" },
   });
 });
 
@@ -76,6 +96,14 @@ router.get("/auth/invites/:token", async (req: Request, res: Response) => {
 
 // Bound password work and basic per-address throttling. Deployments should also rate-limit at their proxy.
 const attempts = new Map<string, { count: number; until: number }>();
+function tooManyAttempts(req: Request): boolean {
+  const key = req.ip ?? "unknown";
+  const now = Date.now();
+  for (const [k, v] of attempts) if (v.until < now) attempts.delete(k);
+  const entry = attempts.get(key) ?? { count: 0, until: now + 60_000 };
+  attempts.set(key, entry);
+  return ++entry.count > 20;
+}
 router.use(["/auth/login", "/auth/setup", "/auth/invites"], (req, res, next) => {
   if (req.method !== "POST") {
     next();
@@ -86,12 +114,7 @@ router.use(["/auth/login", "/auth/setup", "/auth/invites"], (req, res, next) => 
     res.status(403).json({ error: "Invalid request origin" });
     return;
   }
-  const key = req.ip ?? "unknown";
-  const now = Date.now();
-  for (const [k, v] of attempts) if (v.until < now) attempts.delete(k);
-  const entry = attempts.get(key) ?? { count: 0, until: now + 60_000 };
-  attempts.set(key, entry);
-  if (++entry.count > 20) {
+  if (tooManyAttempts(req)) {
     res.status(429).json({ error: "Too many attempts. Try again in a minute." });
     return;
   }
@@ -105,9 +128,9 @@ function credentials(req: Request) {
   }
   return { email, password };
 }
-async function signIn(res: Response, user: SessionData["user"]) {
+async function startSession(res: Response, user: SessionData["user"], kind: SessionData["kind"] = "local") {
   const sid = await createSession({
-    kind: "local",
+    kind,
     user: {
       id: user.id,
       email: user.email,
@@ -117,6 +140,9 @@ async function signIn(res: Response, user: SessionData["user"]) {
     },
   });
   setSessionCookie(res, sid);
+}
+async function signIn(res: Response, user: SessionData["user"]) {
+  await startSession(res, user);
   res.json({ ok: true });
 }
 router.post("/auth/setup", async (req, res) => {
@@ -229,6 +255,149 @@ router.post("/auth/invites/:token", async (req, res) => {
 router.post("/auth/logout", async (req, res) => {
   await clearSession(res, getSessionId(req));
   res.json({ ok: true });
+});
+
+/**
+ * Single sign-on with an OpenID Connect provider (DATACAT_OIDC_*). /auth/oidc/start sends the browser to the provider
+ * with a fresh state, nonce and PKCE verifier kept in a short-lived encrypted cookie; the provider sends it back to
+ * /auth/oidc/callback, a top-level GET (so the Origin check above, which covers POSTs, does not apply). Only verified
+ * emails in DATACAT_OIDC_ALLOWED_DOMAINS sign in: an existing account with that email is signed in, otherwise one is
+ * created in the configured organization with DATACAT_OIDC_DEFAULT_ROLE. First-run setup still needs the setup token.
+ * Every failure redirects to /login?error=<code>; details go to the server log only.
+ */
+const oidc = oidcConfig ? new OidcProvider(oidcConfig) : null;
+const OIDC_COOKIE = "datacat_oidc";
+const OIDC_COOKIE_PATH = "/api/auth/oidc";
+const oidcStateKey = stateKey(process.env.SESSION_SECRET);
+const oidcRedirectUri = (req: Request) => `${getOrigin(req)}/api/auth/oidc/callback`;
+const oidcCookieOptions = { httpOnly: true, secure: secureCookies, sameSite: "lax", path: OIDC_COOKIE_PATH } as const;
+
+/** The organization new single sign-on users join, or null before first-run setup created one. */
+async function oidcOrgId(config: OidcConfig): Promise<number | null> {
+  if (config.orgId !== null) {
+    const [org] = await db.select({ id: orgsTable.id }).from(orgsTable).where(eq(orgsTable.id, config.orgId));
+    if (!org) throw new OidcError("oidc_misconfigured", `DATACAT_OIDC_ORG_ID=${config.orgId} is not an existing organization`);
+    return org.id;
+  }
+  const orgs = await db.select({ id: orgsTable.id }).from(orgsTable).orderBy(asc(orgsTable.id)).limit(2);
+  if (orgs.length > 1) throw new OidcError("oidc_misconfigured", "there is more than one organization; set DATACAT_OIDC_ORG_ID to the one new users join");
+  return orgs[0]?.id ?? null;
+}
+
+/** Startup check: with single sign-on enabled, the organization new users join must be unambiguous. */
+export async function checkOidcSetup(): Promise<void> {
+  if (!oidcConfig) return;
+  const [anyOrg] = await db.select({ id: orgsTable.id }).from(orgsTable).limit(1);
+  if (anyOrg) {
+    try {
+      await oidcOrgId(oidcConfig);
+    } catch (e) {
+      throw new Error(`Single sign-on: ${(e as Error).message}`);
+    }
+  }
+  logger.info(
+    {
+      issuer: oidcConfig.issuer,
+      allowedDomains: oidcConfig.allowedDomains,
+      requireHostedDomain: oidcConfig.requireHostedDomain,
+      defaultRole: oidcConfig.defaultRole,
+    },
+    "single sign-on (OIDC) enabled",
+  );
+}
+
+/** The account for a verified, allowed profile: found by email (case-insensitive), or created. */
+async function oidcUser(profile: OidcProfile, config: OidcConfig): Promise<{ user: User; created: boolean }> {
+  const byEmail = async () =>
+    (
+      await db
+        .select()
+        .from(usersTable)
+        .where(sql`lower(${usersTable.email}) = ${profile.email}`)
+    )[0];
+  const existing = await byEmail();
+  if (existing) return { user: existing, created: false };
+  const orgId = await oidcOrgId(config);
+  if (orgId === null) throw new OidcError("oidc_setup_required", "first-run setup is not complete");
+  const [created] = await db
+    .insert(usersTable)
+    .values({
+      email: profile.email,
+      passwordHash: null,
+      orgId,
+      role: config.defaultRole,
+      firstName: profile.firstName,
+      lastName: profile.lastName,
+      profileImageUrl: profile.profileImageUrl,
+    })
+    .onConflictDoNothing()
+    .returning();
+  if (created) return { user: created, created: true };
+  // Another sign-in for the same email created it first.
+  const raced = await byEmail();
+  if (!raced) throw new Error("could not create the account");
+  return { user: raced, created: false };
+}
+
+function oidcRefused(res: Response, e: unknown) {
+  const code = e instanceof OidcError ? e.code : "oidc_failed";
+  if (e instanceof OidcError) logger.warn({ code }, `OIDC sign-in refused: ${e.message}`);
+  else logger.error({ err: e }, "OIDC sign-in failed");
+  res.redirect(`/login?error=${code}`);
+}
+
+router.get("/auth/oidc/start", async (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  if (!oidc) {
+    res.status(404).json({ error: "Single sign-on is not configured" });
+    return;
+  }
+  try {
+    if (!(await hasUsers())) throw new OidcError("oidc_setup_required", "first-run setup is not complete");
+    // Coming back to the login (or an invite) page after signing in would show nothing useful.
+    const returnTo = getSafeReturnTo(req.query.returnTo);
+    const login = newLoginState(/^\/(login([/?#]|$)|invite\/)/.test(returnTo) ? "/" : returnTo);
+    const url = await oidc.authorizationUrl(login, oidcRedirectUri(req));
+    res.cookie(OIDC_COOKIE, sealState(login, oidcStateKey), { ...oidcCookieOptions, maxAge: STATE_TTL_MS });
+    res.redirect(url);
+  } catch (e) {
+    oidcRefused(res, e);
+  }
+});
+
+router.get("/auth/oidc/callback", async (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  if (!oidc) {
+    res.status(404).json({ error: "Single sign-on is not configured" });
+    return;
+  }
+  // The state is single-use: clear it whatever happens next.
+  const login = openState(req.cookies?.[OIDC_COOKIE], oidcStateKey);
+  res.clearCookie(OIDC_COOKIE, oidcCookieOptions);
+  try {
+    if (tooManyAttempts(req)) throw new OidcError("oidc_failed", "too many sign-in attempts from this address");
+    if (!login) throw new OidcError("oidc_state_mismatch", "login state cookie is missing, expired or invalid");
+    if (!sameString(req.query.state, login.state)) throw new OidcError("oidc_state_mismatch", "state does not match the login state cookie");
+    const providerError = req.query.error;
+    if (providerError !== undefined)
+      throw new OidcError(
+        providerError === "access_denied" ? "oidc_cancelled" : "oidc_failed",
+        `provider returned error ${String(providerError).slice(0, 100)}`,
+      );
+    const code = req.query.code;
+    if (typeof code !== "string" || !code || code.length > 4096) throw new OidcError("oidc_failed", "callback has no authorization code");
+    if (!(await hasUsers())) throw new OidcError("oidc_setup_required", "first-run setup is not complete");
+    const claims = await oidc.exchangeCode(code, login, oidcRedirectUri(req));
+    const profile = authorizeClaims(claims, oidc.config);
+    const { user, created } = await oidcUser(profile, oidc.config);
+    await clearSession(res, getSessionId(req));
+    await startSession(res, user, "oidc");
+    logger.info({ userId: user.id, created }, "OIDC sign-in");
+    res.redirect(login.returnTo);
+  } catch (e) {
+    oidcRefused(res, e);
+  }
 });
 
 export default router;

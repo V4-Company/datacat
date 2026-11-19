@@ -5,7 +5,7 @@ import { migrateDatabase, buildBackgroundIndexes } from "./lib/migrate";
 import { storage, useClickHouse } from "./lib/storage";
 import { ensureChSchema } from "./lib/ch";
 import { pool } from "@workspace/db";
-import { generatedSetupToken } from "./routes/auth";
+import { checkOidcSetup, generatedSetupToken } from "./routes/auth";
 import { flushSpanStats } from "./query/apmStats";
 
 const rawPort = process.env["PORT"] ?? "3000";
@@ -13,6 +13,7 @@ const port = Number(rawPort);
 if (Number.isNaN(port) || port <= 0) throw new Error(`Invalid PORT value: "${rawPort}"`);
 
 await migrateDatabase();
+await checkOidcSetup();
 if (useClickHouse) await ensureChSchema();
 logger.info({ storage }, "telemetry storage");
 if (generatedSetupToken && !(await pool.query("select 1 from users limit 1")).rowCount) {

@@ -18,7 +18,8 @@ export interface AuthUser {
 
 export interface SessionData {
   user: AuthUser;
-  kind?: "local";
+  /** How the user signed in: a local password, or single sign-on with the configured OpenID provider. */
+  kind?: "local" | "oidc";
 }
 
 export async function createSession(data: SessionData): Promise<string> {

@@ -1,4 +1,5 @@
 import type { Request } from "express";
+import { loadOidcConfig } from "./oidc";
 
 export const publicUrl = process.env.PUBLIC_URL?.replace(/\/$/, "");
 if (publicUrl && !/^https?:\/\//.test(publicUrl)) throw new Error("PUBLIC_URL must be an http(s) URL");
@@ -11,3 +12,5 @@ export const secureCookies = publicUrl ? new URL(publicUrl).protocol === "https:
 if (process.env.NODE_ENV === "production" && (process.env.SESSION_SECRET?.length ?? 0) < 32) {
   throw new Error("Set SESSION_SECRET to a random value of at least 32 characters");
 }
+// Single sign-on (DATACAT_OIDC_*); null when not configured. An incomplete or unsafe configuration stops startup.
+export const oidcConfig = loadOidcConfig(process.env);

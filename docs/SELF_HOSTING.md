@@ -178,6 +178,13 @@ use systemd `EnvironmentFile`.
 | `DATACAT_SETUP_TOKEN` | Empty. Token required to complete first-run setup. When empty, a random token is generated and printed in the log at startup. |
 | `DATACAT_CUMULATIVE_STREAMS_MAX` | `500000` (minimum 1000). How many cumulative OTLP metric streams are remembered for delta conversion; the oldest are forgotten past this. |
 | `DATACAT_TRUST_PROXY` | Unset (trust no proxy). Set to the number of reverse proxies in front of DataCat (usually `1`), or an Express trust-proxy value, so client addresses and HTTPS are read from `X-Forwarded-*`. Leave unset when DataCat is reached directly. |
+| `DATACAT_OIDC_CLIENT_ID` / `DATACAT_OIDC_CLIENT_SECRET` | Empty (single sign-on off). OAuth client of your OpenID Connect provider; setting both enables "Continue with …" on the login page. See "Single sign-on (OIDC / Google)". |
+| `DATACAT_OIDC_ALLOWED_DOMAINS` | Empty. **Required when single sign-on is enabled**; the server refuses to start without it. Comma-separated email domains allowed to sign in, e.g. `example.com,example.org`. Matched exactly (subdomains are not included). |
+| `DATACAT_OIDC_REQUIRE_HOSTED_DOMAIN` | `true` when the issuer is Google, `false` otherwise. Refuse ID tokens without a hosted-domain (`hd`) claim, i.e. Google accounts that are not Google Workspace accounts. Accepts `true`, `false`, `1` or `0`; anything else stops startup. |
+| `DATACAT_OIDC_ISSUER` | `https://accounts.google.com`. Issuer URL of the provider; its `/.well-known/openid-configuration` is used. Must be `https://` (`http://localhost` is accepted for testing). |
+| `DATACAT_OIDC_DEFAULT_ROLE` | `member`. Role of accounts created by single sign-on: `member` or `admin`. |
+| `DATACAT_OIDC_LABEL` | `Google`. Provider name on the login button ("Continue with Google"). |
+| `DATACAT_OIDC_ORG_ID` | Empty. Organization new single sign-on users join. Defaults to the organization created at first-run setup; required if the database has more than one organization. |
 | `DATACAT_ALLOW_PRIVATE_WEBHOOKS` | `false`. Webhook and Slack channels may not target loopback, private, link-local or metadata addresses, and redirects are not followed. Set `true` for receivers on your own network. |
 | `DATACAT_CLICKHOUSE_ASYNC_INSERT` | `1`. ClickHouse async inserts; each request still waits for the insert to be acknowledged. |
 | `DATACAT_STATS_FLUSH_MS` | `10000`. How often APM rollups are written (PostgreSQL storage). |
@@ -209,7 +216,8 @@ Webhook destination URLs and optional headers are sensitive database contents.
 4. Under **Users**, invite an email and copy its link. Share it using a private channel.
    Opening the link lets a new member set their password. Links expire in 30 days and
    are consumed once; they are not permanent bearer-login URLs.
-5. Members log in with email/password at `/login`. Sign out using the account menu.
+5. Members log in with email/password at `/login`, or with single sign-on when it is configured
+   (see "Single sign-on (OIDC / Google)"). Sign out using the account menu.
 
 Passwords use randomly salted scrypt, never plaintext. Opaque sessions live in
 PostgreSQL, expire in seven days, and use HTTP-only SameSite=Lax cookies. HTTPS
@@ -218,6 +226,39 @@ Local login is throttled per IP (set `DATACAT_TRUST_PROXY` behind a reverse prox
 real client address is used). Cookie-authenticated changes must come from DataCat's own origin.
 There is currently no email/password-reset service; keep administrator credentials
 safe and follow your organization's controlled account recovery procedures.
+
+### Single sign-on (OIDC / Google)
+
+Members can also sign in with Google, or any OpenID Connect provider, instead of a password.
+Only addresses in `DATACAT_OIDC_ALLOWED_DOMAINS` whose email the provider reports as verified
+are accepted. With Google, the account must also be a Google Workspace account whose domain
+(`hd`) is in that list: anyone can create a personal Google account with an address at your
+domain, and Google reports that address as verified. Set `DATACAT_OIDC_REQUIRE_HOSTED_DOMAIN=false`
+only if you also need to admit personal Google accounts. Other providers do not send `hd`, so it is
+not required for them unless you set it to `true`.
+The first sign-in of an unknown address creates an account in the organization with
+`DATACAT_OIDC_DEFAULT_ROLE`; an existing account with the same email (for example one created
+by an invite) is signed in. First-run setup still uses a password and the setup token, so create
+the administrator first.
+
+For Google:
+
+1. In the Google Cloud console, open **APIs & Services → OAuth consent screen**. For a Google
+   Workspace organization choose **Internal**, so only your Workspace accounts can use the app.
+2. Under **Credentials**, create an **OAuth client ID** of type **Web application** with the
+   authorized redirect URI `<PUBLIC_URL>/api/auth/oidc/callback`, e.g.
+   `https://observe.example.com/api/auth/oidc/callback`.
+3. Set `DATACAT_OIDC_CLIENT_ID`, `DATACAT_OIDC_CLIENT_SECRET` and `DATACAT_OIDC_ALLOWED_DOMAINS`
+   (e.g. `example.com`), and restart DataCat. The login page then shows **Continue with Google**.
+
+For another provider, also set `DATACAT_OIDC_ISSUER` (e.g. `https://login.example.com/realms/main`)
+and `DATACAT_OIDC_LABEL`, and register the same redirect URI. DataCat uses the authorization code
+flow with PKCE and verifies RS256-signed ID tokens; the provider must return the `email` and
+`email_verified` claims. Set `PUBLIC_URL` (and `DATACAT_TRUST_PROXY` behind a proxy) so the
+redirect URI matches exactly. Sign-in failures are explained on the login page and logged on the
+server. Accounts created this way have no password, so they cannot use password login. To remove
+someone's access, disable them at the provider: while their domain is allowed, signing in again
+recreates a deleted account.
 
 ### HTTPS
 
