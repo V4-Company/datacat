@@ -7,6 +7,7 @@ import { and, eq } from "drizzle-orm";
 import { requireOrg, requireAdmin, requireAdminOrKeys } from "../middlewares/authMiddleware";
 import { checkWebhookUrl, checkWebhookHeaders } from "../lib/safeHttp";
 import { newKey, invalidateKey } from "../lib/org";
+import { MCP_TOKEN_KIND } from "../lib/mcpTokens";
 import { evaluateMonitor, validateMonitorQuery } from "../jobs/monitors";
 import { startSampleData, stopSampleData, sampleRunning } from "../jobs/sample";
 import { intakeStats } from "../lib/intakeStats";
@@ -381,27 +382,38 @@ router.post(
 );
 
 // ---------- Org settings ----------
+/**
+ * Active keys of the organization. Only admins see API keys in full; application keys are shown once, when created.
+ * Personal MCP tokens are listed to admins only (so they can revoke them with DELETE /ui/org/keys/:id), with their
+ * owner and never their value.
+ */
+export function orgKeyList(rows: (typeof apiKeysTable.$inferSelect)[], isAdmin: boolean) {
+  return rows
+    .filter((k) => !k.revoked && (isAdmin || k.kind !== MCP_TOKEN_KIND))
+    .map((k) => ({
+      id: k.id,
+      name: k.name,
+      kind: k.kind,
+      key: isAdmin && k.kind === "api" ? k.key : undefined,
+      hint: `${k.key.slice(0, 4)}…${k.key.slice(-4)}`,
+      created_by: k.createdBy,
+      created_at: k.createdAt,
+      last_used_at: k.lastUsedAt,
+    }));
+}
+
 router.get(
   "/ui/org",
   h(async (req, res) => {
     const [org] = await db.select().from(orgsTable).where(eq(orgsTable.id, req.orgId!));
-    const keys = (await db.select().from(apiKeysTable).where(eq(apiKeysTable.orgId, req.orgId!))).filter((k) => !k.revoked);
+    const keys = await db.select().from(apiKeysTable).where(eq(apiKeysTable.orgId, req.orgId!));
     const members = await db.select().from(usersTable).where(eq(usersTable.orgId, req.orgId!));
     const invites = await db.select().from(invitesTable).where(eq(invitesTable.orgId, req.orgId!));
     res.json({
       org,
       me: req.authUser,
       public_url: getOrigin(req),
-      // Only admins see API keys in full; application keys are shown once, when created.
-      keys: keys.map((k) => ({
-        id: k.id,
-        name: k.name,
-        kind: k.kind,
-        key: req.authUser?.role === "admin" && k.kind === "api" ? k.key : undefined,
-        hint: `${k.key.slice(0, 4)}…${k.key.slice(-4)}`,
-        created_at: k.createdAt,
-        last_used_at: k.lastUsedAt,
-      })),
+      keys: orgKeyList(keys, req.authUser?.role === "admin"),
       members: members.map((m) => ({
         id: m.id,
         email: m.email,

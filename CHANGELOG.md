@@ -11,6 +11,11 @@ First public release.
   for APM services, spans and traces, metrics, logs, monitors and dashboards. API key + application key only; cookie
   sessions and foreign origins are refused, and outputs are capped. See "MCP server for AI assistants" in
   docs/SELF_HOSTING.md.
+- Personal MCP tokens: any signed-in user (members included) creates read-only tokens for `/api/mcp` at
+  `/account/mcp` and connects with `Authorization: Bearer <token>`, without an admin key pair. Up to 10 active tokens
+  per user; a token stops working when revoked or when its creator leaves the organization, and admins can revoke any
+  token in their organization. MCP tools now call the API with an internal read-only credential instead of the
+  caller's keys, so MCP cannot write even with an admin's key pair.
 
 - Server and web UI: metrics explorer, dashboards, logs with live tail, APM with trace waterfalls, infrastructure,
   monitors with webhook and Slack notifications, organizations, local accounts and invite links.

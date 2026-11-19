@@ -11,6 +11,7 @@ import { LogsExplorer } from "@/pages/Logs";
 import { ApmServices, ApmService, TraceExplorer, TraceView } from "@/pages/Apm";
 import { Events, OrgSettings, AgentSetup, Home, Login } from "@/pages/Misc";
 import { Docs } from "@/pages/Docs";
+import { McpSetup } from "@/pages/Mcp";
 
 export default function App() {
   const auth = useAuthUser();
@@ -41,6 +42,7 @@ export default function App() {
             <Route path="/event/explorer" component={Events} />
             <Route path="/organization-settings" component={OrgSettings} />
             <Route path="/account/agent" component={AgentSetup} />
+            <Route path="/account/mcp" component={McpSetup} />
             <Route path="/docs" component={Docs} />
             <Route path="/docs/:section" component={Docs} />
             <Route path="/search">

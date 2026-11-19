@@ -1,9 +1,11 @@
 import { rangeOf } from "./http";
 import { logger } from "./logger";
+import { internalCredentialHeaders } from "./mcpInternal";
 
 // Read-only tools of the MCP endpoint (routes/mcp.ts). Each tool calls DataCat's own HTTP API over loopback with the
-// caller's API key + application key, so it sees exactly what the keys can see and works the same on PostgreSQL and
-// ClickHouse storage. Nothing here writes; outputs are compact and capped so they fit in a model's context.
+// internal MCP credential for the caller's organization (lib/mcpInternal.ts), which authMiddleware accepts for reads
+// only, so the tools work the same on PostgreSQL and ClickHouse storage and cannot write whoever the caller is. Outputs
+// are compact and capped so they fit in a model's context.
 
 export type FetchLike = (url: string, init?: RequestInit) => Promise<Response>;
 
@@ -23,16 +25,17 @@ export function loopbackBase(env: Record<string, string | undefined> = process.e
 }
 
 /**
- * API client that forwards the caller's keys to this server. Only the two key headers are sent (never cookies), and
- * redirects are refused. Errors carry the API's own message, which is already safe to show (lib/http.ts).
+ * API client for this server, acting for one organization with the internal read-only credential. Nothing of the MCP
+ * caller's (keys, token, cookies) is sent, and redirects are refused. Errors carry the API's own message, which is
+ * already safe to show (lib/http.ts).
  */
-export function loopbackApi(opts: { base: string; apiKey: string; appKey: string; fetch?: FetchLike; timeoutMs?: number }): ApiCall {
+export function loopbackApi(opts: { base: string; orgId: number; fetch?: FetchLike; timeoutMs?: number }): ApiCall {
   const doFetch = opts.fetch ?? ((url: string, init?: RequestInit) => fetch(url, init));
   const timeoutMs = opts.timeoutMs ?? API_TIMEOUT_MS;
   return async (path, req = {}) => {
     const url = new URL(`/api${path}`, opts.base);
     for (const [k, v] of Object.entries(req.query ?? {})) if (v !== undefined && v !== "") url.searchParams.set(k, String(v));
-    const headers: Record<string, string> = { accept: "application/json", "dd-api-key": opts.apiKey, "dd-application-key": opts.appKey };
+    const headers: Record<string, string> = { accept: "application/json", ...internalCredentialHeaders(opts.orgId) };
     if (req.body !== undefined) headers["content-type"] = "application/json";
     let status: number;
     let text: string;

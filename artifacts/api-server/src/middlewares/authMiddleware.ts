@@ -2,6 +2,7 @@ import { type NextFunction, type Request, type Response } from "express";
 import { clearSession, getSession, getSessionId, type SessionData } from "../lib/auth";
 import { resolveMembership, orgForApiKey, type OrgUser } from "../lib/org";
 import { getOrigin } from "../lib/config";
+import { isReadOnlyRequest, takeInternalCredential } from "../lib/mcpInternal";
 import { db, apiKeysTable } from "@workspace/db";
 import { and, eq } from "drizzle-orm";
 
@@ -12,6 +13,8 @@ declare global {
       sessionUser?: SessionData["user"] | null;
       orgId?: number;
       viaKeys?: boolean;
+      /** A tool call of the MCP server (lib/mcpInternal.ts): reads of req.orgId only, no user and no keys. */
+      viaMcp?: boolean;
     }
   }
 }
@@ -20,6 +23,19 @@ const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 
 export async function authMiddleware(req: Request, res: Response, next: NextFunction) {
   try {
+    // MCP tool calls over loopback carry their own credential and nothing else; an invalid one is dropped and ignored.
+    const mcpOrgId = takeInternalCredential(req);
+    if (mcpOrgId !== null) {
+      if (!isReadOnlyRequest(req.method, req.path)) {
+        res.status(403).json({ errors: ["MCP access is read-only"] });
+        return;
+      }
+      req.orgId = mcpOrgId;
+      req.viaMcp = true;
+      next();
+      return;
+    }
+
     const sid = getSessionId(req);
     // Cookie sessions: a state-changing request must come from DataCat's own pages (SameSite=Lax cookies already stop
     // most cross-site requests; this also covers sibling subdomains).
